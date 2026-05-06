@@ -1,0 +1,25 @@
+node_modules
+dist
+nout
+.DS_Store
+.eslintcache
+*.log*
+.idea
+.kiro
+/download/
+
+temp
+temp/log.txt
+/.kiro/
+/.vscode/
+/.codebuddy/
+/.idea/
+docs/.vitepress/dist
+docs/.vitepress/cache
+
+# dev / runtime artifacts
+.electron-dev-userdata-test/
+.electron-launch/
+.claude/
+.workflow/
+plugins/
