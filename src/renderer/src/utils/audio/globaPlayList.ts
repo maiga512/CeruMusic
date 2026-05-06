@@ -69,7 +69,7 @@ const getRestoredContextSong = () => {
     getSongFromListById(songInfo.value.songmid)
 }
 
-const AUTO_NEXT_DELAY_MS = 200
+const AUTO_NEXT_DELAY_MS = 1500
 let pendingAutoNextTimer: ReturnType<typeof setTimeout> | null = null
 let pendingAutoNextToken = 0
 
@@ -809,10 +809,10 @@ const initPlayback = async () => {
 
   initPlaylistEventListeners(localUserStore, playSong)
 
-  // 初始化无感过渡管理器：注入 getNextSong 回调；自然结束后的自动下一首改走 2 秒延迟
+  // 初始化无感过渡管理器：注入 getNextSong 回调
   crossfadeManager.init(getNextSong)
-  // 不启用自然结束延迟，让 crossfade 系统或 ended 回退正常触发下一首
-  crossfadeManager.setNaturalNextDelayEnabled(false)
+  // 启用自然结束延迟：不提前交叉淡化，等歌曲自然结束后再走 ended 延迟切歌
+  crossfadeManager.setNaturalNextDelayEnabled(true)
   controlAudio.subscribe('slotSwap', () => {
     autoNextCount.value = 0
     // 关键：翻转槽位后，playSong 挂在旧 primary 上的 DOM error/playing 监听器仍然存在。
@@ -889,10 +889,10 @@ const initPlayback = async () => {
       userInfo.value.currentTime = Audio.value.currentTime
     }
   }, 1000)
-  // 歌曲自然结束后的自动下一首（当 crossfade 未触发时的回退）
+  // 歌曲自然结束后的自动下一首（等待 1.5 秒后再播放，避免重叠）
   controlAudio.subscribe('ended', () => {
     window.requestAnimationFrame(() => {
-      void playNext()
+      void playNextAuto()
     })
   })
 }
