@@ -1,0 +1,154 @@
+name: Sync Existing Releases to Alist
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '要同步的特定标签（如 v1.0.0），留空则同步所有版本'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  sync-releases-to-alist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+
+      - name: Get all releases
+        id: get-releases
+        run: |
+          response=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases")
+          echo "releases_json=$(echo "$response" | jq -c '.')" >> $GITHUB_OUTPUT
+
+      - name: Sync releases to Alist（自动登录 & 上传）
+        run: |
+          # ========== 1. 读取输入参数 ==========
+          SPECIFIC_TAG="${{ github.event.inputs.tag_name }}"
+          RELEASES_JSON='${{ steps.get-releases.outputs.releases_json }}'
+
+          # ========== 2. Alist 连接信息 ==========
+          ALIST_URL="https://alist.shiqianjiang.cn"          # https://pan.example.com
+          ALIST_USER="${{ secrets.WEBDAV_USERNAME }}"    # Alist 登录账号
+          ALIST_PASS="${{ secrets.WEBDAV_PASSWORD }}"    # Alist 登录密码
+          ALIST_DIR="/yd/ceru"                          # 目标根目录
+
+          # ========== 3. 登录拿 token ==========
+          echo "正在登录 Alist ..."
+          login_resp=$(curl -s -X POST "$ALIST_URL/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{
+                  \"username\": \"$ALIST_USER\",
+                  \"password\": \"$ALIST_PASS\"
+                }")
+          echo "$login_resp"
+          token=$(echo "$login_resp" | jq -r '.data.token // empty')
+
+          if [ -z "$token" ]; then
+            echo "❌ 登录失败，返回：$login_resp"
+            exit 1
+          fi
+          echo "✅ 登录成功，token 已获取"
+
+          # ========== 4. 循环处理 release ==========
+          releases_count=$(echo "$RELEASES_JSON" | jq '. | length')
+          echo "找到 $releases_count 个 releases"
+          for i in $(seq 0 $(($releases_count - 1))); do
+            release=$(echo "$RELEASES_JSON" | jq -c ".[$i]")
+            tag_name=$(echo "$release" | jq -r '.tag_name')
+            release_id=$(echo "$release" | jq -r '.id')
+
+            [ -n "$SPECIFIC_TAG" ] && [ "$tag_name" != "$SPECIFIC_TAG" ] && {
+              echo "跳过 $tag_name，不是指定标签"
+              continue
+            }
+
+            echo "处理版本: $tag_name (ID: $release_id)"
+            assets_json=$(curl -s \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$release_id/assets")
+            assets_count=$(echo "$assets_json" | jq '. | length')
+            echo "找到 $assets_count 个资源文件"
+
+            for j in $(seq 0 $(($assets_count - 1))); do
+              asset=$(echo "$assets_json" | jq -c ".[$j]")
+              asset_name=$(echo "$asset" | jq -r '.name')
+              asset_url=$(echo "$asset" | jq -r '.url')
+              asset_size=$(echo "$asset" | jq -r '.size')
+
+              echo "下载资源: $asset_name (大小: $asset_size bytes)"
+              safe_filename="./temp_download_$(date +%s)_$j"
+
+              # 下载
+              curl -sL -o "$safe_filename" \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/octet-stream" \
+                "$asset_url" || {
+                echo "❌ 下载失败: $asset_name"
+                continue
+              }
+
+              # 大小校验
+              actual_size=$(wc -c < "$safe_filename")
+              [ "$actual_size" -ne "$asset_size" ] && {
+                echo "❌ 文件大小不匹配: $asset_name"
+                rm -f "$safe_filename"
+                continue
+              }
+
+              # 组装远程路径（URL 编码）
+              remote_path="$ALIST_DIR/$tag_name/$asset_name"
+              file_path_encoded=$(printf %s "$remote_path" | jq -sRr @uri)
+              echo "上传到 Alist: $remote_path"
+
+              # 调用 /api/fs/put 上传（带 As-Task 异步）
+              response=$(
+                curl -s -X PUT "$ALIST_URL/api/fs/put" \
+                  -H "Authorization: $token" \
+                  -H "File-Path: $file_path_encoded" \
+                  -H "Content-Type: application/octet-stream" \
+                  -H "Content-Length: $actual_size" \
+                  -H "As-Task: true" \
+                  --data-binary @"$safe_filename"
+              )
+              echo "==== 上传接口原始返回 ===="
+              echo "$response"
+              code=$(echo "$response" | jq -r '.code // empty')
+              if [ "$code" = "200" ]; then
+                echo "✅ Alist 上传任务创建成功: $asset_name"
+              else
+                echo "❌ Alist 上传失败: $asset_name"
+              fi
+
+              rm -f "$safe_filename"
+              echo "----------------------------------------"
+            done
+            echo "版本 $tag_name 处理完成"
+            echo "========================================"
+          done
+
+          # ========== 5. 退出登录 ==========
+          echo "退出登录 ..."
+          curl -s -X POST "$ALIST_URL/api/auth/logout" \
+            -H "Authorization: $token" > /dev/null || true
+
+          echo "🎉 Alist 同步完成"
+
+      - name: Summary
+        run: |
+          echo "同步任务已完成！"
+          echo "请检查 Alist 中的文件是否正确上传。"
+          echo "如果遇到问题，请检查以下配置："
+          echo "1. ALIST_URL      - Alist 服务器地址"
+          echo "2. ALIST_USERNAME - Alist 登录账号"
+          echo "3. ALIST_PASSWORD - Alist 登录密码"
+          echo "4. GITHUB_TOKEN   - GitHub 访问令牌"

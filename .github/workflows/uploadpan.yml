@@ -1,0 +1,160 @@
+name: Sync Existing Releases to WebDAV
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '要同步的特定标签（如 v1.0.0），留空则同步所有版本'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  sync-releases-to-webdav:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+
+      - name: Get all releases
+        id: get-releases
+        run: |
+          response=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases")
+          echo "releases_json=$(echo "$response" | jq -c '.')" >> $GITHUB_OUTPUT
+
+      - name: Sync releases to WebDAV
+        run: |
+          # 读取输入参数
+          SPECIFIC_TAG="${{ github.event.inputs.tag_name }}"
+          RELEASES_JSON='${{ steps.get-releases.outputs.releases_json }}'
+
+          echo "开始同步 releases..."
+          echo "特定标签: ${SPECIFIC_TAG:-所有版本}"
+          echo "WebDAV 根路径: ${{ secrets.WEBDAV_BASE_URL }}/yd/ceru"
+
+          # 处理每个 release
+          releases_count=$(echo "$RELEASES_JSON" | jq '. | length')
+          echo "找到 $releases_count 个 releases"
+
+          for i in $(seq 0 $(($releases_count - 1))); do
+            release=$(echo "$RELEASES_JSON" | jq -c ".[$i]")
+            tag_name=$(echo "$release" | jq -r '.tag_name')
+            release_id=$(echo "$release" | jq -r '.id')
+            
+            if [ -n "$SPECIFIC_TAG" ] && [ "$tag_name" != "$SPECIFIC_TAG" ]; then
+              echo "跳过 $tag_name，不是指定的标签 $SPECIFIC_TAG"
+              continue
+            fi
+
+            echo "正在处理版本: $tag_name (ID: $release_id)"
+
+            # 获取该release的所有资源文件
+            assets_json=$(curl -s \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$release_id/assets")
+
+            assets_count=$(echo "$assets_json" | jq '. | length')
+            echo "找到 $assets_count 个资源文件"
+
+            # 处理每个asset
+            for j in $(seq 0 $(($assets_count - 1))); do
+              asset=$(echo "$assets_json" | jq -c ".[$j]")
+              asset_name=$(echo "$asset" | jq -r '.name')
+              asset_url=$(echo "$asset" | jq -r '.url')
+              asset_size=$(echo "$asset" | jq -r '.size')
+              
+              echo "下载资源: $asset_name (大小: $asset_size bytes)"
+
+              # 下载资源文件
+              safe_filename="./temp_download"
+              
+              if ! curl -sL -o "$safe_filename" \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/octet-stream" \
+                "$asset_url"; then
+                echo "❌ 下载失败: $asset_name"
+                continue
+              fi
+              
+              if [ -f "$safe_filename" ]; then
+                actual_size=$(wc -c < "$safe_filename")
+                if [ "$actual_size" -ne "$asset_size" ]; then
+                  echo "❌ 文件大小不匹配: $asset_name (期望: $asset_size, 实际: $actual_size)"
+                  rm -f "$safe_filename"
+                  continue
+                fi
+
+                echo "上传到 WebDAV: $asset_name"
+                
+                # 构建远程路径
+                remote_path="/yd/ceru/$tag_name/$asset_name"
+                full_url="${{ secrets.WEBDAV_BASE_URL }}$remote_path"
+                
+                echo "完整路径: $full_url"
+                
+                # 使用 WebDAV PUT 方法上传文件
+                if curl -s -f -X PUT \
+                  -u "${{ secrets.WEBDAV_USERNAME }}:${{ secrets.WEBDAV_PASSWORD }}" \
+                  -T "$safe_filename" \
+                  "$full_url"; then
+                  
+                  echo "✅ WebDAV 上传成功: $asset_name"
+                  
+                  # 验证文件是否存在
+                  echo "验证文件是否存在..."
+                  sleep 2
+                  
+                  if curl -s -f -u "${{ secrets.WEBDAV_USERNAME }}:${{ secrets.WEBDAV_PASSWORD }}" \
+                    -X PROPFIND \
+                    -H "Depth: 0" \
+                    "$full_url" > /dev/null 2>&1; then
+                    echo "✅ 文件确认存在: $asset_name"
+                  else
+                    echo "⚠️  文件验证失败，但上传可能成功"
+                  fi
+                  
+                else
+                  echo "❌ WebDAV 上传失败: $asset_name"
+                  echo "尝试创建目录后重新上传..."
+                  
+                  # 尝试先创建目录
+                  dir_path="/yd/ceru/$tag_name"
+                  dir_url="${{ secrets.WEBDAV_BASE_URL }}$dir_path"
+                  
+                  if curl -s -f -X MKCOL \
+                    -u "${{ secrets.WEBDAV_USERNAME }}:${{ secrets.WEBDAV_PASSWORD }}" \
+                    "$dir_url"; then
+                    echo "✅ 目录创建成功: $dir_path"
+                    
+                    # 重新尝试上传文件
+                    if curl -s -f -X PUT \
+                      -u "${{ secrets.WEBDAV_USERNAME }}:${{ secrets.WEBDAV_PASSWORD }}" \
+                      -T "$safe_filename" \
+                      "$full_url"; then
+                      echo "✅ 重新上传成功: $asset_name"
+                    else
+                      echo "❌ 重新上传失败: $asset_name"
+                    fi
+                  else
+                    echo "❌ 目录创建失败: $dir_path"
+                  fi
+                fi
+                
+                # 安全删除临时文件
+                rm -f "$safe_filename"
+                echo "----------------------------------------"
+              else
+                echo "❌ 文件不存在: $safe_filename"
+              fi
+            done
+          done
+
+          echo "🎉 WebDAV 同步完成"
