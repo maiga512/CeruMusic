@@ -39,6 +39,7 @@ type UserRow = {
 type PairCodeRow = {
   id: string;
   user_id: string;
+  code?: string | null;
   code_hash: string;
   expires_at: number;
   used_at: string | null;
@@ -193,6 +194,57 @@ export class SyncDatabase {
     this.db.close();
   }
 
+  getSetting(key: string) {
+    const row = this.db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key) as {value: string} | undefined;
+    return row?.value || '';
+  }
+
+  setSetting(key: string, value: string) {
+    const at = nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(key, value, at);
+  }
+
+  deleteSetting(key: string) {
+    this.db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(key);
+  }
+
+  createAdminSession(token: string, ttlMs: number) {
+    const at = nowIso();
+    const expiresAt = Date.now() + ttlMs;
+    this.db
+      .prepare(
+        `INSERT INTO admin_sessions (token_hash, expires_at, created_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(hashToken(token), expiresAt, at);
+    return expiresAt;
+  }
+
+  authenticateAdminToken(token: string) {
+    const tokenHash = hashToken(token);
+    const row = this.db
+      .prepare(
+        `SELECT token_hash
+         FROM admin_sessions
+         WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?`,
+      )
+      .get(tokenHash, Date.now()) as {token_hash: string} | undefined;
+    return Boolean(row);
+  }
+
+  revokeAdminSessions() {
+    const at = nowIso();
+    return this.db
+      .prepare(`UPDATE admin_sessions SET revoked_at = ? WHERE revoked_at IS NULL`)
+      .run(at).changes;
+  }
+
   createUser(input: {username: string; email?: string; nickname?: string; passwordHash: string}) {
     const at = nowIso();
     const user = {
@@ -234,47 +286,93 @@ export class SyncDatabase {
     return rows.map(toUser);
   }
 
-  createPairCode(input: {userId: string; ttlMs: number}) {
+  deleteUser(userId: string) {
+    const user = this.findUserById(userId);
+    if (!user) return null;
+    const result = this.db.prepare(`DELETE FROM users WHERE id = ?`).run(userId);
+    return {user, deleted: result.changes > 0};
+  }
+
+  listUserSummaries() {
+    const rows = this.db
+      .prepare(
+        `SELECT u.*,
+                COALESCE(r.current_revision, 0) AS current_revision,
+                (SELECT COUNT(*) FROM playlists p WHERE p.user_id = u.id AND p.deleted_at IS NULL) AS playlist_count,
+                (SELECT COUNT(*) FROM playlist_songs ps WHERE ps.user_id = u.id AND ps.deleted_at IS NULL) AS song_count,
+                (SELECT COUNT(*) FROM favorites f WHERE f.user_id = u.id AND f.deleted_at IS NULL) AS favorite_count,
+                (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > ?) AS active_session_count,
+                (SELECT pc.code FROM pair_codes pc WHERE pc.user_id = u.id AND pc.code IS NOT NULL ORDER BY pc.created_at ASC LIMIT 1) AS binding_code
+         FROM users u
+         LEFT JOIN user_revision r ON r.user_id = u.id
+         ORDER BY u.created_at ASC`,
+      )
+      .all(Date.now()) as Array<
+      UserRow & {
+        current_revision: number;
+        playlist_count: number;
+        song_count: number;
+        favorite_count: number;
+        active_session_count: number;
+        binding_code: string | null;
+      }
+    >;
+
+    return rows.map((row) => ({
+      ...toUser(row),
+      revision: Number(row.current_revision || 0),
+      playlistCount: Number(row.playlist_count || 0),
+      songCount: Number(row.song_count || 0),
+      favoriteCount: Number(row.favorite_count || 0),
+      activeSessionCount: Number(row.active_session_count || 0),
+      bindingCode: row.binding_code || '',
+      hasBindingCode: Boolean(row.binding_code),
+    }));
+  }
+
+  createPairCode(input: {userId: string; ttlMs?: number}) {
     const user = this.findUserById(input.userId);
     if (!user) return null;
+
+    const existing = this.db
+      .prepare(`SELECT * FROM pair_codes WHERE user_id = ? AND code IS NOT NULL ORDER BY created_at ASC LIMIT 1`)
+      .get(input.userId) as PairCodeRow | undefined;
+    if (existing?.code) return {code: existing.code, expiresAt: null, user, existing: true};
 
     const code = createPairCode();
     const at = nowIso();
     const row: PairCodeRow = {
       id: createId('pair'),
       user_id: input.userId,
+      code,
       code_hash: hashToken(code),
-      expires_at: Date.now() + input.ttlMs,
+      expires_at: 0,
       used_at: null,
       created_at: at,
     };
 
     this.db
       .prepare(
-        `INSERT INTO pair_codes (id, user_id, code_hash, expires_at, used_at, created_at)
-         VALUES (@id, @user_id, @code_hash, @expires_at, @used_at, @created_at)`,
+        `INSERT INTO pair_codes (id, user_id, code, code_hash, expires_at, used_at, created_at)
+         VALUES (@id, @user_id, @code, @code_hash, @expires_at, @used_at, @created_at)`,
       )
       .run(row);
 
-    return {code, expiresAt: row.expires_at, user};
+    return {code, expiresAt: null, user, existing: false};
   }
 
   consumePairCode(code: string) {
     const codeHash = hashToken(code.trim().toUpperCase());
-    const at = nowIso();
-    return this.db.transaction(() => {
-      const row = this.db
-        .prepare(
-          `SELECT pc.*
-           FROM pair_codes pc
-           WHERE pc.code_hash = ? AND pc.used_at IS NULL AND pc.expires_at > ?`,
-        )
-        .get(codeHash, Date.now()) as PairCodeRow | undefined;
-      if (!row) return null;
+    const row = this.db
+      .prepare(
+        `SELECT pc.*
+         FROM pair_codes pc
+         WHERE pc.code_hash = ? AND (pc.expires_at = 0 OR pc.expires_at > ?)`,
+      )
+      .get(codeHash, Date.now()) as PairCodeRow | undefined;
+    if (!row) return null;
 
-      this.db.prepare(`UPDATE pair_codes SET used_at = ? WHERE id = ? AND used_at IS NULL`).run(at, row.id);
-      return this.findUserById(row.user_id);
-    })();
+    return this.findUserById(row.user_id);
   }
 
   createSession(userId: string, token: string, ttlMs: number) {
@@ -594,6 +692,19 @@ export class SyncDatabase {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS admin_sessions (
+        token_hash TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS sessions (
         token_hash TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -606,6 +717,7 @@ export class SyncDatabase {
       CREATE TABLE IF NOT EXISTS pair_codes (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
+        code TEXT,
         code_hash TEXT NOT NULL UNIQUE,
         expires_at INTEGER NOT NULL,
         used_at TEXT,
@@ -691,6 +803,15 @@ export class SyncDatabase {
       CREATE INDEX IF NOT EXISTS idx_sync_events_user_revision ON sync_events(user_id, revision);
       CREATE INDEX IF NOT EXISTS idx_pair_codes_hash ON pair_codes(code_hash, expires_at, used_at);
     `);
+
+    this.migrateSchema();
+  }
+
+  private migrateSchema() {
+    const pairColumns = this.db.prepare(`PRAGMA table_info(pair_codes)`).all() as Array<{name: string}>;
+    if (!pairColumns.some((column) => column.name === 'code')) {
+      this.db.prepare(`ALTER TABLE pair_codes ADD COLUMN code TEXT`).run();
+    }
   }
 
   private writeTransaction<T>(userId: string, callback: (revision: number, at: string) => T) {

@@ -1,12 +1,17 @@
 import {createServer, type IncomingMessage, type ServerResponse} from 'node:http';
 import {URL} from 'node:url';
 
+import {renderAdminPage} from './adminPage.ts';
 import {createToken, hashPassword, verifyPassword} from './crypto.ts';
 import {SyncDatabase} from './database.ts';
 import type {AuthUser, RequestContext, UnknownRecord} from './types.ts';
 
 const DEFAULT_SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
-const DEFAULT_PAIR_CODE_TTL_MS = 1000 * 60 * 10;
+const DEFAULT_ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+const ADMIN_PASSWORD_SETTING_KEY = 'admin.passwordHash';
+const ADMIN_USERNAME_SETTING_KEY = 'admin.username';
+const DEFAULT_ADMIN_USERNAME = 'admin';
+const DEFAULT_ADMIN_PASSWORD = 'password';
 
 export type ServerConfig = {
   port: number;
@@ -81,11 +86,19 @@ const parseMultipartTextFields = (buffer: Buffer, contentType: string): UnknownR
 const sendJson = (response: ServerResponse, statusCode: number, payload: unknown) => {
   response.writeHead(statusCode, {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-admin-token',
     'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
     'Content-Type': 'application/json; charset=utf-8',
   });
   response.end(JSON.stringify(payload));
+};
+
+const sendHtml = (response: ServerResponse, html: string) => {
+  response.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+  response.end(html);
 };
 
 const toPublicAuthUser = (user: AuthUser) => ({
@@ -112,12 +125,30 @@ const requireAuth = (auth: RequestContext | null) => {
   return auth;
 };
 
-const requireAdmin = (request: IncomingMessage) => {
-  const adminToken = process.env.CERU_SYNC_ADMIN_TOKEN || '';
-  const provided = String(request.headers['x-admin-token'] || '');
-  if (!adminToken || provided !== adminToken) {
-    const error = new Error('管理员 token 无效或未配置');
-    Object.assign(error, {statusCode: 403});
+const getAdminToken = (request: IncomingMessage) => {
+  const bearer = getBearerToken(request);
+  if (bearer) return bearer;
+  return String(request.headers['x-admin-token'] || '');
+};
+
+const getAdminPasswordHash = async (database: SyncDatabase) => {
+  const existing = database.getSetting(ADMIN_PASSWORD_SETTING_KEY);
+  if (existing) return existing;
+  const passwordHash = await hashPassword(DEFAULT_ADMIN_PASSWORD);
+  database.setSetting(ADMIN_PASSWORD_SETTING_KEY, passwordHash);
+  return passwordHash;
+};
+
+const getAdminUsername = (database: SyncDatabase) => database.getSetting(ADMIN_USERNAME_SETTING_KEY) || DEFAULT_ADMIN_USERNAME;
+
+const requireAdmin = (database: SyncDatabase, request: IncomingMessage) => {
+  const token = getAdminToken(request);
+  const envAdminToken = process.env.CERU_SYNC_ADMIN_TOKEN || '';
+  if (envAdminToken && token === envAdminToken) return;
+
+  if (!token || !database.authenticateAdminToken(token)) {
+    const error = new Error('请先登录管理后台');
+    Object.assign(error, {statusCode: 401});
     throw error;
   }
 };
@@ -201,11 +232,11 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
   },
   '/admin/users': {
     GET: ({request}) => {
-      requireAdmin(request);
-      return {items: database.listUsers()};
+      requireAdmin(database, request);
+      return {items: database.listUserSummaries()};
     },
     POST: async ({request, body}) => {
-      requireAdmin(request);
+      requireAdmin(database, request);
       const username = getString(body.username || body.email);
       if (!username) {
         const error = new Error('username 不能为空');
@@ -213,19 +244,160 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
         throw error;
       }
 
-      const tempPassword = getString(body.password) || createToken();
+      const tempPassword = createToken();
       const user = database.createUser({
         username,
-        email: getString(body.email) || undefined,
-        nickname: getString(body.nickname) || undefined,
+        email: undefined,
+        nickname: username,
         passwordHash: await hashPassword(tempPassword),
       });
-      return {user: toPublicAuthUser(user), tempPassword: getString(body.password) ? undefined : tempPassword};
+      return {user: toPublicAuthUser(user)};
+    },
+    DELETE: ({request, body, url}) => {
+      requireAdmin(database, request);
+      const userId = getBodyOrQueryId(body, url, ['userId', 'id']);
+      const confirmText = getString(body.confirmText);
+      if (!userId) {
+        const error = new Error('userId 不能为空');
+        Object.assign(error, {statusCode: 400});
+        throw error;
+      }
+      if (confirmText !== '我要删除') {
+        const error = new Error('请输入“我要删除”确认删除');
+        Object.assign(error, {statusCode: 400});
+        throw error;
+      }
+
+      const result = database.deleteUser(userId);
+      if (!result?.deleted) {
+        const error = new Error('用户不存在');
+        Object.assign(error, {statusCode: 404});
+        throw error;
+      }
+      return {success: true, user: toPublicAuthUser(result.user)};
+    },
+  },
+  '/admin/login': {
+    POST: async ({body}) => {
+      const username = getString(body.username);
+      const password = getString(body.password);
+      if (username !== getAdminUsername(database) || !password) {
+        const error = new Error('管理员账号或密码错误');
+        Object.assign(error, {statusCode: 401});
+        throw error;
+      }
+
+      const passwordHash = await getAdminPasswordHash(database);
+      if (!(await verifyPassword(password, passwordHash))) {
+        const error = new Error('管理员账号或密码错误');
+        Object.assign(error, {statusCode: 401});
+        throw error;
+      }
+
+      const token = createToken();
+      const expiresAt = database.createAdminSession(token, DEFAULT_ADMIN_SESSION_TTL_MS);
+      return {
+        accessToken: token,
+        expiresAt,
+        admin: {
+          username: getAdminUsername(database),
+          defaultAccount: getAdminUsername(database) === DEFAULT_ADMIN_USERNAME && password === DEFAULT_ADMIN_PASSWORD,
+        },
+      };
+    },
+  },
+  '/admin/bootstrap': {
+    GET: async () => {
+      const username = getAdminUsername(database);
+      const passwordHash = await getAdminPasswordHash(database);
+      const defaultPassword = await verifyPassword(DEFAULT_ADMIN_PASSWORD, passwordHash);
+      return {
+        admin: {username, defaultAccount: username === DEFAULT_ADMIN_USERNAME && defaultPassword},
+      };
+    },
+  },
+  '/admin/change-username': {
+    POST: ({request, body}) => {
+      requireAdmin(database, request);
+      const username = getString(body.username);
+      if (!username) {
+        const error = new Error('管理员用户名不能为空');
+        Object.assign(error, {statusCode: 400});
+        throw error;
+      }
+      database.setSetting(ADMIN_USERNAME_SETTING_KEY, username);
+      return {success: true, admin: {username}};
+    },
+  },
+  '/admin/reset-admin': {
+    POST: async ({request, body}) => {
+      const token = getAdminToken(request);
+      const envAdminToken = process.env.CERU_SYNC_ADMIN_TOKEN || '';
+      if (!envAdminToken || token !== envAdminToken) {
+        const error = new Error('需要使用 CERU_SYNC_ADMIN_TOKEN 重置管理员账号');
+        Object.assign(error, {statusCode: 401});
+        throw error;
+      }
+
+      const username = getString(body.username) || DEFAULT_ADMIN_USERNAME;
+      const password = getString(body.password);
+      if (!password) {
+        const error = new Error('新管理员密码不能为空');
+        Object.assign(error, {statusCode: 400});
+        throw error;
+      }
+      if (password.length < 6) {
+        const error = new Error('新管理员密码至少需要 6 位');
+        Object.assign(error, {statusCode: 400});
+        throw error;
+      }
+
+      database.setSetting(ADMIN_USERNAME_SETTING_KEY, username);
+      database.setSetting(ADMIN_PASSWORD_SETTING_KEY, await hashPassword(password));
+      return {success: true, admin: {username}};
+    },
+  },
+  '/admin/change-password': {
+    POST: async ({request, body}) => {
+      requireAdmin(database, request);
+      const oldPassword = getString(body.oldPassword);
+      const newPassword = getString(body.newPassword);
+      if (!oldPassword || !newPassword) {
+        const error = new Error('旧密码和新密码不能为空');
+        Object.assign(error, {statusCode: 400});
+        throw error;
+      }
+      if (newPassword.length < 6) {
+        const error = new Error('新密码至少需要 6 位');
+        Object.assign(error, {statusCode: 400});
+        throw error;
+      }
+
+      const passwordHash = await getAdminPasswordHash(database);
+      if (!(await verifyPassword(oldPassword, passwordHash))) {
+        const error = new Error('旧密码不正确');
+        Object.assign(error, {statusCode: 401});
+        throw error;
+      }
+
+      database.setSetting(ADMIN_PASSWORD_SETTING_KEY, await hashPassword(newPassword));
+      database.revokeAdminSessions();
+      return {success: true};
+    },
+  },
+  '/admin/status': {
+    GET: ({request}) => {
+      requireAdmin(database, request);
+      return {
+        service: {status: 'ok', name: '@ceru/nas-sync-server', version: '0.1.0'},
+        admin: {username: getAdminUsername(database)},
+        users: database.listUserSummaries(),
+      };
     },
   },
   '/admin/pair-codes': {
     POST: ({request, body}) => {
-      requireAdmin(request);
+      requireAdmin(database, request);
       const username = getString(body.username || body.email);
       const userId = getString(body.userId);
       const account = userId ? database.findUserById(userId) : username ? database.findUserWithPassword(username)?.user : null;
@@ -235,14 +407,13 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
         throw error;
       }
 
-      const ttlMs = Number(body.ttlMs || DEFAULT_PAIR_CODE_TTL_MS);
-      const pair = database.createPairCode({userId: account.id, ttlMs: Number.isFinite(ttlMs) ? ttlMs : DEFAULT_PAIR_CODE_TTL_MS});
+      const pair = database.createPairCode({userId: account.id});
       if (!pair) {
         const error = new Error('创建配对码失败');
         Object.assign(error, {statusCode: 500});
         throw error;
       }
-      return {pairCode: pair.code, expiresAt: pair.expiresAt, user: toPublicAuthUser(pair.user)};
+      return {pairCode: pair.code, expiresAt: pair.expiresAt, existing: pair.existing, user: toPublicAuthUser(pair.user)};
     },
   },
   '/auth/refresh': {
@@ -379,6 +550,11 @@ export const createSyncServer = ({database}: ServerConfig) => {
 
     const url = new URL(request.url || '/', 'http://localhost');
     const method = request.method || 'GET';
+
+    if ((url.pathname === '/' || url.pathname === '/admin') && method === 'GET') {
+      sendHtml(response, renderAdminPage());
+      return;
+    }
 
     try {
       const token = getBearerToken(request);

@@ -383,6 +383,7 @@ import { ref, onMounted, nextTick, toRaw, computed } from 'vue'
 import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import { LocalUserDetailStore } from '@renderer/store/LocalUserDetail'
 import ImportPlaylist from '@renderer/components/ServicePlugin/ImportPlaylist.vue'
+import { runNasSyncNow } from '@renderer/services/nasSyncPoller'
 
 interface PluginSource {
   name: string
@@ -476,8 +477,17 @@ const configValues = ref<Record<string, any>>({})
 const configSaving = ref(false)
 const configTesting = ref(false)
 const configTestResult = ref<{ success: boolean; message: string } | null>(null)
+const savedConfigSnapshot = ref<Record<string, any>>({})
 const configServiceRole = ref('')
 const isNasSyncConfig = computed(() => configServiceRole.value === 'nas-sync')
+const NAS_SYNC_PERSISTED_KEYS = [
+  'accessToken',
+  'tokenExpiresAt',
+  'userId',
+  'username',
+  'nickname',
+  'status'
+]
 
 // 导入歌单相关
 const importDialogVisible = ref(false)
@@ -860,66 +870,174 @@ async function openConfigDialog(plugin: Plugin) {
     // 获取已保存的配置
     const configRes = await window.api.plugins.getConfig(plugin.pluginId)
     const savedConfig = configRes?.data || {}
+    savedConfigSnapshot.value = JSON.parse(JSON.stringify(savedConfig))
 
     // 用 schema 默认值填充
     const values: Record<string, any> = {}
     for (const field of configSchema.value) {
       values[field.key] = savedConfig[field.key] ?? field.default ?? ''
     }
+    if (plugin.serviceRole === 'nas-sync') {
+      for (const key of NAS_SYNC_PERSISTED_KEYS) {
+        if (savedConfig[key] !== undefined) values[key] = savedConfig[key]
+      }
+    }
     configValues.value = values
 
     configDialogVisible.value = true
+    if (plugin.serviceRole === 'nas-sync') {
+      void probeNasSyncConnection({ silent: true })
+    }
   } catch (err: any) {
     MessagePlugin.error(`获取插件配置失败: ${err.message}`)
   }
 }
 
-async function loginNasSyncPlugin() {
-  if (!configValues.value.serverUrl?.trim()) {
-    MessagePlugin.warning('请先填写 NAS 同步服务器地址')
-    return
-  }
-  if (!configValues.value.pairCode?.trim()) {
-    MessagePlugin.warning('请填写绑定码')
-    return
+function buildPluginConfigForSave() {
+  const plainConfig = JSON.parse(JSON.stringify(toRaw(configValues.value)))
+  if (!isNasSyncConfig.value) {
+    return plainConfig
   }
 
+  const savedPairCode = String(savedConfigSnapshot.value.pairCode || '').trim()
+  const currentPairCode = String(plainConfig.pairCode || '').trim()
+  if (!currentPairCode && savedPairCode) {
+    plainConfig.pairCode = savedPairCode
+    configValues.value.pairCode = savedPairCode
+  }
+  for (const key of NAS_SYNC_PERSISTED_KEYS) {
+    if (
+      (plainConfig[key] === undefined || plainConfig[key] === '') &&
+      savedConfigSnapshot.value[key] !== undefined
+    ) {
+      plainConfig[key] = savedConfigSnapshot.value[key]
+      configValues.value[key] = savedConfigSnapshot.value[key]
+    }
+  }
+  return plainConfig
+}
+
+async function ensureNasSyncSession(reason = 'manual', options: { sync?: boolean } = {}) {
+  if (!configValues.value.serverUrl?.trim()) {
+    throw new Error('请先填写 NAS 同步服务器地址')
+  }
+
+  const currentPairCode =
+    String(configValues.value.pairCode || '').trim() ||
+    String(savedConfigSnapshot.value.pairCode || '').trim()
+  if (!currentPairCode) {
+    throw new Error('请填写绑定码')
+  }
+  configValues.value.pairCode = currentPairCode
+
+  const baseUrl = String(configValues.value.serverUrl || '').trim().replace(/\/+$/, '')
+  const response = await fetch(`${baseUrl}/auth/pair`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ pairCode: currentPairCode })
+  })
+  const body = await response.json().catch(() => null)
+  if (!response.ok || body?.success === false) {
+    throw new Error(body?.error || `NAS 同步服务请求失败：${response.status}`)
+  }
+
+  const session = body?.success === true && 'data' in body ? body.data : body
+  configValues.value.enabled = true
+  configValues.value.accessToken = session.accessToken
+  configValues.value.tokenExpiresAt = session.expiresAt
+  configValues.value.userId = session.user?.id || ''
+  configValues.value.username = session.user?.username || ''
+  configValues.value.nickname = session.user?.nickname || ''
+  configValues.value.status = 'connected'
+
+  const plainConfig = buildPluginConfigForSave()
+  await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
+  savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
+  configTestResult.value = { success: true, message: 'NAS 同步服务已连接' }
+
+  if (plainConfig.enabled && options.sync !== false) {
+    runNasSyncNow(reason).catch((error) => {
+      console.error('NAS 首轮同步失败:', error)
+      MessagePlugin.warning(`NAS 已连接，首轮同步失败：${error.message || '未知错误'}`)
+    })
+  }
+
+  return plainConfig
+}
+
+async function probeNasSyncConnection(options: { silent?: boolean } = {}) {
+  const plainConfig = buildPluginConfigForSave()
+  const baseUrl = String(plainConfig.serverUrl || '').trim().replace(/\/+$/, '')
+  if (!baseUrl) {
+    configValues.value.status = 'disconnected'
+    configTestResult.value = { success: false, message: '请先填写 NAS 同步服务器地址' }
+    return configTestResult.value
+  }
+
+  const token = String(plainConfig.accessToken || '').trim()
+  if (token) {
+    try {
+      const response = await fetch(`${baseUrl}/me`, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`
+        }
+      })
+      const body = await response.json().catch(() => null)
+      if (response.ok && body?.success !== false) {
+        const user = body?.success === true && 'data' in body ? body.data : body
+        configValues.value.enabled = true
+        configValues.value.status = 'connected'
+        configValues.value.userId = user?.id || configValues.value.userId || ''
+        configValues.value.username = user?.username || configValues.value.username || ''
+        configValues.value.nickname = user?.nickname || configValues.value.nickname || ''
+        const nextConfig = buildPluginConfigForSave()
+        await window.api.plugins.saveConfig(configPluginId.value, nextConfig)
+        savedConfigSnapshot.value = JSON.parse(JSON.stringify(nextConfig))
+        configTestResult.value = { success: true, message: 'NAS 同步服务已连接' }
+        return configTestResult.value
+      }
+    } catch {
+      // token 探测失败时继续尝试用长期绑定码重新配对
+    }
+  }
+
+  const pairCode =
+    String(plainConfig.pairCode || '').trim() ||
+    String(savedConfigSnapshot.value.pairCode || '').trim()
+  if (pairCode) {
+    try {
+      await ensureNasSyncSession('probe', { sync: false })
+      return { success: true, message: 'NAS 同步服务已连接' }
+    } catch (error: any) {
+      configValues.value.status = 'disconnected'
+      configTestResult.value = { success: false, message: error.message || 'NAS 同步服务未连接' }
+      if (!options.silent) MessagePlugin.error(configTestResult.value.message)
+      return configTestResult.value
+    }
+  }
+
+  configValues.value.status = 'disconnected'
+  configTestResult.value = { success: false, message: '服务器可访问时仍需绑定码登录' }
+  if (!options.silent) MessagePlugin.error(configTestResult.value.message)
+  return configTestResult.value
+}
+
+async function loginNasSyncPlugin() {
   configTesting.value = true
   configTestResult.value = null
   try {
-    const baseUrl = String(configValues.value.serverUrl || '').trim().replace(/\/+$/, '')
-    const response = await fetch(`${baseUrl}/auth/pair`, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ pairCode: configValues.value.pairCode })
-    })
-    const body = await response.json().catch(() => null)
-    if (!response.ok || body?.success === false) {
-      throw new Error(body?.error || `NAS 同步服务请求失败：${response.status}`)
-    }
-
-    const session = body?.success === true && 'data' in body ? body.data : body
-    configValues.value.enabled = true
-    configValues.value.accessToken = session.accessToken
-    configValues.value.tokenExpiresAt = session.expiresAt
-    configValues.value.userId = session.user?.id || ''
-    configValues.value.username = session.user?.username || ''
-    configValues.value.nickname = session.user?.nickname || ''
-    configValues.value.pairCode = ''
-    configValues.value.status = 'connected'
-
-    const plainConfig = JSON.parse(JSON.stringify(toRaw(configValues.value)))
-    await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
-    configTestResult.value = { success: true, message: 'NAS 同步服务已连接' }
+    await ensureNasSyncSession('login')
     MessagePlugin.success('NAS 同步服务已连接')
   } catch (err: any) {
     configValues.value.status = 'disconnected'
     configValues.value.accessToken = ''
-    const plainConfig = JSON.parse(JSON.stringify(toRaw(configValues.value)))
+    const plainConfig = buildPluginConfigForSave()
     await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
+    savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
     configTestResult.value = { success: false, message: err.message || 'NAS 同步服务连接失败' }
     MessagePlugin.error(err.message || 'NAS 同步服务连接失败')
   } finally {
@@ -941,8 +1059,13 @@ async function savePluginConfig() {
     }
 
     // toRaw + JSON round-trip 去除 Vue Proxy，避免 IPC structuredClone 报错
-    const plainConfig = JSON.parse(JSON.stringify(toRaw(configValues.value)))
-    await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
+    let plainConfig = buildPluginConfigForSave()
+    if (isNasSyncConfig.value && plainConfig.serverUrl && plainConfig.pairCode) {
+      plainConfig = await ensureNasSyncSession('save')
+    } else {
+      await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
+      savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
+    }
     MessagePlugin.success('配置已保存')
     configDialogVisible.value = false
   } catch (err: any) {
@@ -958,9 +1081,18 @@ async function testPluginConnection() {
   configTestResult.value = null
 
   try {
+    if (isNasSyncConfig.value) {
+      const result = await probeNasSyncConnection()
+      if (result.success) {
+        MessagePlugin.success(result.message || '连接成功')
+      }
+      return
+    }
+
     // 先保存当前配置
-    const plainConfig = JSON.parse(JSON.stringify(toRaw(configValues.value)))
+    const plainConfig = buildPluginConfigForSave()
     await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
+    savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
 
     const result = await window.api.plugins.testConnection(configPluginId.value)
     configTestResult.value = result

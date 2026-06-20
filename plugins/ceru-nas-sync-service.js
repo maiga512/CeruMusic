@@ -4,15 +4,15 @@
  * 把部署在 NAS 上的多端同步服务作为澜音服务插件接入。
  *
  * @name NAS 多端同步
- * @author CeruMusic
- * @version 1.0.2
+ * @author maiga512
+ * @version 1.0.3
  * @description 连接你部署在 NAS 上的同步服务器，用于歌单备份与多端同步
  */
 
 const pluginInfo = {
   name: 'NAS 多端同步',
-  version: '1.0.2',
-  author: 'CeruMusic',
+  version: '1.0.3',
+  author: 'maiga512',
   description: '连接你部署在 NAS 上的同步服务器，用于歌单备份与多端同步'
 }
 
@@ -34,7 +34,7 @@ const configSchema = [
     key: 'pairCode',
     label: '登录绑定码',
     type: 'text',
-    placeholder: '填写 NAS 同步服务端生成的一次性绑定码'
+    placeholder: '填写 NAS 管理后台为当前用户生成的长期绑定码'
   }
 ]
 

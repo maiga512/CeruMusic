@@ -437,7 +437,19 @@ const pluginService = {
   },
 
   saveConfig(pluginId: string, config: Record<string, any>) {
-    savePluginConfig(pluginId, config)
+    const plugin = this.getPluginById(pluginId)
+    const previousConfig = getPluginConfig(pluginId)
+    const nextConfig = { ...config }
+
+    if (plugin?.getServiceRole() === 'nas-sync') {
+      const previousPairCode = String(previousConfig.pairCode || '').trim()
+      const nextPairCode = String(nextConfig.pairCode || '').trim()
+      if (previousPairCode && !nextPairCode) {
+        nextConfig.pairCode = previousPairCode
+      }
+    }
+
+    savePluginConfig(pluginId, nextConfig)
   },
 
   deleteConfig(pluginId: string) {
