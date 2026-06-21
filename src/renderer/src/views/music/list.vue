@@ -656,9 +656,6 @@ const checkCloudSync = async () => {
         local: localUpdatedAt
       })
 
-      // 显示轻量级提示，不阻塞用户操作
-      const syncMsg = MessagePlugin.info('正在后台同步云端歌单更新...', 0)
-
       try {
         // 获取云端完整列表 (使用循环分页获取所有歌曲)
         let allCloudSongs: CloudSongDto[] = []
@@ -701,10 +698,7 @@ const checkCloudSync = async () => {
         songs.value = localMappedSongs
         playlistInfo.value.total = localMappedSongs.length
 
-        syncMsg.then((inst) => inst.close())
-        MessagePlugin.success('歌单已同步至最新')
       } catch (e) {
-        syncMsg.then((inst) => inst.close())
         console.error('静默同步失败', e)
         // 失败不打扰用户，下次进入会自动重试
       }
@@ -713,14 +707,10 @@ const checkCloudSync = async () => {
         cloud: cloudUpdatedAt,
         local: localUpdatedAt
       })
-      const syncMsg = MessagePlugin.info('正在后台同步本地歌单更新...', 0)
-
       try {
-        await handleSyncToCloud()
-      } catch {
-        MessagePlugin.error('同步到云端失败')
-      } finally {
-        syncMsg.then((inst) => inst.close())
+        await handleSyncToCloud(true)
+      } catch (error) {
+        console.warn('静默同步到云端失败:', error)
       }
     }
   } catch (error) {
@@ -1718,7 +1708,7 @@ const renderIcon = (icon: Component) => {
   return () => h(NIcon, null, { default: () => h(icon) })
 }
 
-const handleUploadToCloud = async () => {
+const handleUploadToCloud = async (silent = false) => {
   try {
     const newMeta = await handleUploadToCloudHelper(
       {
@@ -1728,7 +1718,9 @@ const handleUploadToCloud = async () => {
         cover: playlistInfo.value.cover,
         meta: playlistInfo.value.meta
       },
-      songs.value
+      songs.value,
+      undefined,
+      { silent }
     )
     playlistInfo.value.meta = newMeta
   } catch (e: any) {
@@ -1736,7 +1728,7 @@ const handleUploadToCloud = async () => {
   }
 }
 
-const handleSyncToCloud = async () => {
+const handleSyncToCloud = async (silent = false) => {
   try {
     const newMeta = await handleSyncToCloudHelper(
       {
@@ -1746,7 +1738,9 @@ const handleSyncToCloud = async () => {
         cover: playlistInfo.value.cover,
         meta: playlistInfo.value.meta
       },
-      songs.value
+      songs.value,
+      undefined,
+      { silent }
     )
     playlistInfo.value.meta = newMeta
   } catch (e: any) {

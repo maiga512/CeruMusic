@@ -14,6 +14,10 @@ export interface PlaylistInfo {
   meta: any
 }
 
+type CloudSyncHelperOptions = {
+  silent?: boolean
+}
+
 const getSongListSyncAPI = async () => (await getPreferredSongListAPI()) || cloudSongListAPI
 
 const isMissingCloudPlaylistError = (error: unknown) => {
@@ -79,9 +83,10 @@ const createCloudPlaylistFromLocal = async (playlist: PlaylistInfo, songs: any[]
 export async function handleUploadToCloudHelper(
   playlist: PlaylistInfo,
   songs: any[],
-  onSuccess?: () => void
+  onSuccess?: () => void,
+  options: CloudSyncHelperOptions = {}
 ) {
-  const loadingMsg = MessagePlugin.loading('正在上传到云端...', 0)
+  const loadingMsg = options.silent ? null : MessagePlugin.loading('正在上传到云端...', 0)
   try {
     const cover = isBase64(playlist.cover)
       ? base64ToFile(playlist.cover, 'cover.png')
@@ -103,16 +108,16 @@ export async function handleUploadToCloudHelper(
       isSynced: true
     }
 
-    loadingMsg.then((inst) => inst.close())
-    MessagePlugin.success('上传成功')
+    loadingMsg?.then((inst) => inst.close())
+    if (!options.silent) MessagePlugin.success('上传成功')
 
     if (onSuccess) onSuccess()
 
     return resultMeta
   } catch (e: any) {
-    loadingMsg.then((inst) => inst.close())
+    loadingMsg?.then((inst) => inst.close())
     console.error(e)
-    MessagePlugin.error('上传失败: ' + (e.message || '未知错误'))
+    if (!options.silent) MessagePlugin.error('上传失败: ' + (e.message || '未知错误'))
     throw e
   }
 }
@@ -123,9 +128,10 @@ export async function handleUploadToCloudHelper(
 export async function handleSyncToCloudHelper(
   playlist: PlaylistInfo,
   songs: any[],
-  onSuccess?: () => void
+  onSuccess?: () => void,
+  options: CloudSyncHelperOptions = {}
 ) {
-  const loadingMsg = MessagePlugin.loading('正在同步到云端...', 0)
+  const loadingMsg = options.silent ? null : MessagePlugin.loading('正在同步到云端...', 0)
   try {
     if (!playlist.meta?.cloudId) {
       throw new Error('未关联云端歌单')
@@ -153,11 +159,11 @@ export async function handleSyncToCloudHelper(
       const created = await createCloudPlaylistFromLocal(playlist, songs, cover)
       cloudId = created.id
       updateRes = created
-      MessagePlugin.warning('云端原歌单不存在，已用本地歌单重新建立同步副本')
+      if (!options.silent) MessagePlugin.warning('云端原歌单不存在，已用本地歌单重新建立同步副本')
     }
 
-    loadingMsg.then((inst) => inst.close())
-    MessagePlugin.success('同步成功')
+    loadingMsg?.then((inst) => inst.close())
+    if (!options.silent) MessagePlugin.success('同步成功')
 
     const newTimestamp = updateRes?.updatedAt || new Date().toISOString()
 
@@ -174,9 +180,9 @@ export async function handleSyncToCloudHelper(
 
     return resultMeta
   } catch (e: any) {
-    loadingMsg.then((inst) => inst.close())
+    loadingMsg?.then((inst) => inst.close())
     console.error(e)
-    MessagePlugin.error('同步失败: ' + (e.message || '未知错误'))
+    if (!options.silent) MessagePlugin.error('同步失败: ' + (e.message || '未知错误'))
     throw e
   }
 }

@@ -1,4 +1,5 @@
 import songListAPI from '@renderer/api/songList'
+import { MessagePlugin } from 'tdesign-vue-next'
 import {
   canUseNasSync,
   getNasSyncMode,
@@ -20,6 +21,7 @@ import type { SongList, Songs } from '@common/types/songList'
 const ACTIVE_INTERVAL_MS = 60_000
 const BACKGROUND_INTERVAL_MS = 300_000
 const ERROR_BACKOFF_MS = 120_000
+const OFFLINE_BACKOFF_MS = 300_000
 const LOCAL_CHANGE_DEBOUNCE_MS = 5_000
 const NAS_SYNC_SERVICE_NAME = 'NAS 多端同步'
 
@@ -30,6 +32,8 @@ let stopped = true
 let applyingRemoteEvents = false
 let initialSyncRunning = false
 let suppressLocalChangeEventsUntil = 0
+let syncServerOffline = false
+let lastOfflineLogAt = 0
 
 type NasSyncEvent = {
   revision?: number
@@ -148,6 +152,25 @@ const appendNasSyncLog = async (message: string, level: 'info' | 'warn' | 'error
   await window.api.plugins
     .appendPluginLog(plugin.pluginId, level, NAS_SYNC_SERVICE_NAME, message)
     .catch(() => {})
+}
+
+const getErrorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : typeof error === 'string' ? error : '未知错误'
+
+const markNasSyncOffline = async (error: unknown) => {
+  const now = Date.now()
+  if (!syncServerOffline || now - lastOfflineLogAt > OFFLINE_BACKOFF_MS) {
+    syncServerOffline = true
+    lastOfflineLogAt = now
+    await appendNasSyncLog(`[同步服务离线] ${getErrorMessage(error)}，已暂停前台提示，稍后后台重试`, 'warn')
+  }
+}
+
+const markNasSyncOnline = async () => {
+  if (!syncServerOffline) return
+  syncServerOffline = false
+  await appendNasSyncLog('[同步服务恢复] 连接成功，正在同步变更')
+  MessagePlugin.success('同步服务已连接，正在同步', 2500)
 }
 
 const getLocalPlaylistByRemoteId = async (remoteId: string, localId?: string) => {
@@ -446,9 +469,12 @@ export const runNasSyncNow = async (reason = 'manual') => {
     const mode = await getNasSyncMode()
     if (mode === 'backup-to-cloud') return await backupLocalLibraryToCloud(reason)
     if (mode === 'restore-from-cloud') return await restoreCloudLibraryToLocal(reason)
-    return await runAutoSync(reason)
+    const result = await runAutoSync(reason)
+    await markNasSyncOnline()
+    return result
   } catch (error) {
     await appendNasSyncLog(`[首轮同步失败] ${error instanceof Error ? error.message : String(error)}`, 'error')
+    await markNasSyncOffline(error)
     throw error
   } finally {
     initialSyncRunning = false
@@ -472,6 +498,7 @@ const pollNasSync = async () => {
 
     const sinceRevision = await getScopedNasSyncLastRevision()
     const result = await nasSyncAPI.sync(sinceRevision)
+    await markNasSyncOnline()
     if (typeof result.revision === 'number') {
       await setScopedNasSyncLastRevision(result.revision)
     }
@@ -485,7 +512,8 @@ const pollNasSync = async () => {
     scheduleNext()
   } catch (error) {
     console.warn('[nas-sync] poll failed:', error)
-    scheduleNext(ERROR_BACKOFF_MS)
+    await markNasSyncOffline(error)
+    scheduleNext(syncServerOffline ? OFFLINE_BACKOFF_MS : ERROR_BACKOFF_MS)
   } finally {
     running = false
   }
@@ -509,6 +537,7 @@ const flushLocalNasSyncBackup = async () => {
     await runNasSyncNow('local-change')
   } catch (error) {
     console.warn('[nas-sync] local backup failed:', error)
+    await markNasSyncOffline(error)
   }
 }
 
