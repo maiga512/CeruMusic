@@ -193,17 +193,22 @@ const loadPlaylists = async () => {
       const syncAPI = await getPreferredSongListAPI()
       if (!syncAPI && !authStore.isAuthenticated) {
         console.log('未登录跳过云歌单')
-        return []
+        return { success: true, lists: [] }
       }
-      return await (syncAPI || cloudSongListAPI).getUserSongLists().catch((err) => {
+      try {
+        const lists = await (syncAPI || cloudSongListAPI).getUserSongLists()
+        return { success: true, lists: Array.isArray(lists) ? lists : [] }
+      } catch (err: any) {
         MessagePlugin.error(err.message || '获取云歌单失败')
-        return []
-      })
+        return { success: false, lists: [] }
+      }
     }
-    const [localRes, cloudRes] = await Promise.all([songListAPI.getAll(), getCloudSongList()])
+
+    const [localRes, cloudResult] = await Promise.all([songListAPI.getAll(), getCloudSongList()])
 
     const localLists = (localRes.success ? localRes.data : []) || []
-    const cloudLists: CloudSongList[] = Array.isArray(cloudRes) ? cloudRes : []
+    const cloudLists: CloudSongList[] = Array.isArray(cloudResult.lists) ? cloudResult.lists : []
+    const cloudFetchOk = cloudResult.success
     const activeCloudIds = new Set(cloudLists.map((item) => item.id))
 
     console.log('Local Lists:', localLists)
@@ -218,10 +223,14 @@ const loadPlaylists = async () => {
       // Ensure meta exists
       if (!l.meta) l.meta = {}
       if (l.meta.cloudId && !l.meta.isCloudOnly && !activeCloudIds.has(l.meta.cloudId)) {
+        // 仅在云端可达时才删除本地歌单（服务器断连时保留本地数据）
+        if (cloudFetchOk) {
         songListAPI.delete(l.id).catch((error) => {
           console.error('删除已在云端移除的本地歌单失败:', error)
         })
         return
+        }
+        // 云端不可达，保留本地歌单
       }
       localMap.set(l.id, l)
       mergedLists.push(l)

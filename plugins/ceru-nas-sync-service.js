@@ -5,13 +5,13 @@
  *
  * @name NAS 多端同步
  * @author maiga512
- * @version 1.0.3
+ * @version 1.0.4
  * @description 连接你部署在 NAS 上的同步服务器，用于歌单备份与多端同步
  */
 
 const pluginInfo = {
   name: 'NAS 多端同步',
-  version: '1.0.3',
+  version: '1.0.4',
   author: 'maiga512',
   description: '连接你部署在 NAS 上的同步服务器，用于歌单备份与多端同步'
 }

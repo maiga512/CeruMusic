@@ -384,6 +384,7 @@ import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import { LocalUserDetailStore } from '@renderer/store/LocalUserDetail'
 import ImportPlaylist from '@renderer/components/ServicePlugin/ImportPlaylist.vue'
 import { runNasSyncNow } from '@renderer/services/nasSyncPoller'
+import { startNasSyncPoller, stopNasSyncPoller } from '@renderer/services/nasSyncPoller'
 
 interface PluginSource {
   name: string
@@ -1060,7 +1061,8 @@ async function savePluginConfig() {
 
     // toRaw + JSON round-trip 去除 Vue Proxy，避免 IPC structuredClone 报错
     let plainConfig = buildPluginConfigForSave()
-    if (isNasSyncConfig.value && plainConfig.serverUrl && plainConfig.pairCode) {
+    // 仅在开关打开时才走登录绑定流程；关闭时直接保存 enabled=false
+    if (isNasSyncConfig.value && plainConfig.serverUrl && plainConfig.pairCode && plainConfig.enabled !== false) {
       plainConfig = await ensureNasSyncSession('save')
     } else {
       await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
@@ -1068,6 +1070,17 @@ async function savePluginConfig() {
     }
     MessagePlugin.success('配置已保存')
     configDialogVisible.value = false
+
+    // 根据开关状态控制同步轮询
+    if (isNasSyncConfig.value) {
+      const currentEnabled = plainConfig.enabled !== false
+      const wasEnabled = savedConfigSnapshot.value.enabled !== false
+      if (currentEnabled && !wasEnabled) {
+        startNasSyncPoller()
+      } else if (!currentEnabled && wasEnabled) {
+        stopNasSyncPoller()
+      }
+    }
   } catch (err: any) {
     MessagePlugin.error(`保存配置失败: ${err.message}`)
   } finally {
