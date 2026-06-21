@@ -69,6 +69,81 @@ const removePlaylistState = (id: string) => {
 
 const getSongListSyncAPI = async () => (await getPreferredSongListAPI()) || cloudSongListAPI
 
+const getPlaylistSortTime = (playlist: SongList) =>
+  Date.parse(
+    String(
+      playlist.meta?.cloudOrderAt ||
+        playlist.meta?.cloudUpdatedAt ||
+        playlist.createTime ||
+        playlist.updateTime ||
+        ''
+    )
+  ) || 0
+
+const sortPlaylistsStable = (items: SongList[], favId?: string | null) => {
+  return [...items].sort((a, b) => {
+    if (favId && a.id === favId) return -1
+    if (favId && b.id === favId) return 1
+    const timeDiff = getPlaylistSortTime(a) - getPlaylistSortTime(b)
+    if (timeDiff !== 0) return timeDiff
+    return String(a.name || '').localeCompare(String(b.name || ''), 'zh-Hans-CN')
+  })
+}
+
+const persistCloudPlaylistLocally = async (cloudPlaylist: CloudSongList, existing?: SongList) => {
+  const remoteId = String(cloudPlaylist.id || '')
+  if (!remoteId) return null
+
+  const syncAPI = await getAutoSyncSongListAPI()
+  const detail = syncAPI
+    ? await syncAPI.getSongListDetail(remoteId).catch(() => null)
+    : await cloudSongListAPI.getSongListDetail(remoteId).catch(() => null)
+  const cloudSongs = Array.isArray(detail?.list) ? detail.list : []
+  const localSongs = cloudSongs.map((song) => mapCloudSongToLocal(song) as Songs)
+  const baseMeta = {
+    ...(existing?.meta || {}),
+    cloudId: remoteId,
+    isSynced: true,
+    cloudUpdatedAt: cloudPlaylist.updatedAt,
+        cloudOrderAt: (cloudPlaylist as any).createdAt || cloudPlaylist.updatedAt || existing?.createTime
+  }
+
+  let localId = existing?.id
+  if (!localId) {
+    const created = await songListAPI.create(cloudPlaylist.name, cloudPlaylist.describe || '', 'local', baseMeta)
+    if (!created.success || !created.data?.id) {
+      throw new Error(created.error || `创建本地歌单失败：${cloudPlaylist.name}`)
+    }
+    localId = created.data.id
+  } else {
+    await songListAPI.edit(localId, {
+      name: cloudPlaylist.name,
+      description: cloudPlaylist.describe || existing?.description || '',
+      coverImgUrl: cloudPlaylist.cover || existing?.coverImgUrl || 'default-cover',
+      source: 'local',
+      meta: getPersistentMeta(baseMeta)
+    })
+  }
+
+  if (cloudPlaylist.cover && cloudPlaylist.cover !== 'default-cover') {
+    await songListAPI.updateCover(localId, cloudPlaylist.cover).catch(() => null)
+  }
+
+  const current = await songListAPI.getSongs(localId)
+  const currentIds = new Set(
+    current.success && Array.isArray(current.data)
+      ? current.data.map((song) => String(song.songmid))
+      : []
+  )
+  const shouldAdd = localSongs.filter((song) => !currentIds.has(String(song.songmid)))
+  if (shouldAdd.length > 0) {
+    await songListAPI.addSongs(localId, shouldAdd)
+  }
+
+  const saved = await songListAPI.getById(localId)
+  return saved.success && saved.data ? saved.data : null
+}
+
 // 对话框状态
 const showCreatePlaylistDialog = ref(false)
 const showImportDialog = ref(false)
@@ -217,6 +292,7 @@ const loadPlaylists = async () => {
     // Merge Logic
     const mergedLists: SongList[] = []
     const localMap = new Map<string, SongList>()
+    const mergedIds = new Set<string>()
 
     // 1. Process Local Lists
     localLists.forEach((l) => {
@@ -225,19 +301,20 @@ const loadPlaylists = async () => {
       if (l.meta.cloudId && !l.meta.isCloudOnly && !activeCloudIds.has(l.meta.cloudId)) {
         // 仅在云端可达时才删除本地歌单（服务器断连时保留本地数据）
         if (cloudFetchOk) {
-        songListAPI.delete(l.id).catch((error) => {
-          console.error('删除已在云端移除的本地歌单失败:', error)
-        })
-        return
+          songListAPI.delete(l.id).catch((error) => {
+            console.error('删除已在云端移除的本地歌单失败:', error)
+          })
+          return
         }
         // 云端不可达，保留本地歌单
       }
       localMap.set(l.id, l)
       mergedLists.push(l)
+      mergedIds.add(l.id)
     })
 
     // 2. Process Cloud Lists
-    cloudLists.forEach((c) => {
+    for (const c of cloudLists) {
       // Try to find matching local list
       // Match by localId (if cloud knows about it) OR by meta.cloudId (if local knows about it)
       let match = localMap.get(c.localId)
@@ -253,39 +330,26 @@ const loadPlaylists = async () => {
         match.meta.cloudId = c.id
         match.meta.isSynced = true
         match.meta.cloudUpdatedAt = c.updatedAt
+        match.meta.cloudOrderAt = match.meta.cloudOrderAt || (c as any).createdAt || c.updatedAt
       } else {
         console.log('Not Matched (Cloud Only):', c.name)
-        // Cloud only list
-        mergedLists.push({
-          id: c.id, // Use cloud ID temporarily (or handle distinction)
-          name: c.name,
-          description: c.describe,
-          coverImgUrl: c.cover,
-          createTime: '',
-          updateTime: c.updatedAt,
-          source: 'local', // Or 'cloud'? But SongList source enum is specific. Let's keep 'local' but mark meta.
-          meta: {
-            isCloudOnly: true,
-            cloudId: c.id,
-            cloudUpdatedAt: c.updatedAt
-          }
-        })
+        const persisted = await persistCloudPlaylistLocally(c)
+        if (persisted) match = persisted
       }
-    })
 
-    playlists.value = mergedLists
+      if (match && !mergedIds.has(match.id)) {
+        mergedLists.push(match)
+        mergedIds.add(match.id)
+      }
+    }
+
+    playlists.value = sortPlaylistsStable(mergedLists, favoritesId.value)
 
     // 读取“我的喜欢”ID并置顶与标记
     try {
       const favRes = await (window as any).api?.songList?.getFavoritesId?.()
       favoritesId.value = (favRes && favRes.data) || null
-      if (favoritesId.value) {
-        const idx = playlists.value.findIndex((p) => p.id === favoritesId.value)
-        if (idx > 0) {
-          const fav = playlists.value.splice(idx, 1)[0]
-          playlists.value.unshift(fav)
-        }
-      }
+      playlists.value = sortPlaylistsStable(playlists.value, favoritesId.value)
     } catch {}
   } catch (error) {
     console.error('加载歌单失败:', error)
