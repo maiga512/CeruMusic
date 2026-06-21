@@ -29,7 +29,7 @@ import {
   type CloudSongList,
   type CloudSongDto
 } from '@renderer/api/cloudSongList'
-import { getPreferredSongListAPI } from '@renderer/api/nasSync'
+import { getAutoSyncSongListAPI, getPreferredSongListAPI } from '@renderer/api/nasSync'
 import { getPersistentMeta } from '@renderer/utils/playlist/meta'
 import { CloudIcon, CloudUploadIcon, CloudDownloadIcon } from 'tdesign-icons-vue-next'
 import { mapCloudSongToLocal } from '@renderer/utils/playlist/cloudList'
@@ -190,7 +190,7 @@ const loadPlaylists = async () => {
   console.log('authStore.isAuthenticated', authStore.isAuthenticated)
   try {
     async function getCloudSongList() {
-      const syncAPI = await getPreferredSongListAPI()
+      const syncAPI = await getAutoSyncSongListAPI()
       if (!syncAPI && !authStore.isAuthenticated) {
         console.log('未登录跳过云歌单')
         return { success: true, lists: [] }

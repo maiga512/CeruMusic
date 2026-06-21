@@ -24,6 +24,17 @@ const configSchema = [
     default: false
   },
   {
+    key: 'syncMode',
+    label: '同步模式',
+    type: 'select',
+    default: 'auto',
+    options: [
+      { label: '备份到云端（本地覆盖云端，不删除云端已有歌单）', value: 'backup-to-cloud' },
+      { label: '从云端恢复到本地（云端合并到本地）', value: 'restore-from-cloud' },
+      { label: '多端自动同步（服务器事件为准）', value: 'auto' }
+    ]
+  },
+  {
     key: 'serverUrl',
     label: 'NAS 同步服务器地址',
     type: 'text',

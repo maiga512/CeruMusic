@@ -356,6 +356,15 @@
               >
                 {{ isNasSyncConfig ? '检测连接' : '测试连接' }}
               </t-button>
+              <t-button
+                v-if="isNasSyncConfig"
+                theme="warning"
+                size="small"
+                :loading="nasSyncRunning"
+                @click="runCurrentNasSyncMode"
+              >
+                执行当前同步模式
+              </t-button>
               <span
                 v-if="configTestResult"
                 class="test-result"
@@ -477,6 +486,7 @@ const configSchema = ref<PluginConfigField[]>([])
 const configValues = ref<Record<string, any>>({})
 const configSaving = ref(false)
 const configTesting = ref(false)
+const nasSyncRunning = ref(false)
 const configTestResult = ref<{ success: boolean; message: string } | null>(null)
 const savedConfigSnapshot = ref<Record<string, any>>({})
 const configServiceRole = ref('')
@@ -990,7 +1000,6 @@ async function probeNasSyncConnection(options: { silent?: boolean } = {}) {
       const body = await response.json().catch(() => null)
       if (response.ok && body?.success !== false) {
         const user = body?.success === true && 'data' in body ? body.data : body
-        configValues.value.enabled = true
         configValues.value.status = 'connected'
         configValues.value.userId = user?.id || configValues.value.userId || ''
         configValues.value.username = user?.username || configValues.value.username || ''
@@ -1061,9 +1070,10 @@ async function savePluginConfig() {
 
     // toRaw + JSON round-trip 去除 Vue Proxy，避免 IPC structuredClone 报错
     let plainConfig = buildPluginConfigForSave()
+    const wasEnabled = savedConfigSnapshot.value.enabled !== false
     // 仅在开关打开时才走登录绑定流程；关闭时直接保存 enabled=false
     if (isNasSyncConfig.value && plainConfig.serverUrl && plainConfig.pairCode && plainConfig.enabled !== false) {
-      plainConfig = await ensureNasSyncSession('save')
+      plainConfig = await ensureNasSyncSession('save', { sync: false })
     } else {
       await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
       savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
@@ -1074,7 +1084,6 @@ async function savePluginConfig() {
     // 根据开关状态控制同步轮询
     if (isNasSyncConfig.value) {
       const currentEnabled = plainConfig.enabled !== false
-      const wasEnabled = savedConfigSnapshot.value.enabled !== false
       if (currentEnabled && !wasEnabled) {
         startNasSyncPoller()
       } else if (!currentEnabled && wasEnabled) {
@@ -1119,6 +1128,31 @@ async function testPluginConnection() {
     MessagePlugin.error(`测试连接失败: ${err.message}`)
   } finally {
     configTesting.value = false
+  }
+}
+
+async function runCurrentNasSyncMode() {
+  if (!isNasSyncConfig.value) return
+  nasSyncRunning.value = true
+  try {
+    const plainConfig = buildPluginConfigForSave()
+    if (!plainConfig.enabled) {
+      MessagePlugin.warning('请先启用 NAS 同步')
+      return
+    }
+    await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
+    savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
+    await ensureNasSyncSession('manual-sync', { sync: false })
+    const result = await runNasSyncNow(String(plainConfig.syncMode || 'auto'))
+    if (result) {
+      MessagePlugin.success('当前同步模式已执行')
+    } else {
+      MessagePlugin.warning('当前没有可执行的同步任务')
+    }
+  } catch (err: any) {
+    MessagePlugin.error(err.message || '执行同步失败')
+  } finally {
+    nasSyncRunning.value = false
   }
 }
 

@@ -31,11 +31,14 @@ type RequestOptions = {
 
 type NasSyncConfig = {
   enabled?: boolean
+  syncMode?: NasSyncMode
   serverUrl?: string
   accessToken?: string
   status?: 'connected' | 'disconnected'
   [key: string]: unknown
 }
+
+export type NasSyncMode = 'backup-to-cloud' | 'restore-from-cloud' | 'auto'
 
 let cachedNasPluginId = ''
 
@@ -74,6 +77,15 @@ const getLegacyNasConfig = (): NasSyncConfig => {
 const getNasConfig = async () => {
   const pluginConfig = await getPluginNasConfig()
   return pluginConfig || getLegacyNasConfig()
+}
+
+export const getNasSyncMode = async (): Promise<NasSyncMode> => {
+  const config = await getNasConfig()
+  const mode = String(config.syncMode || 'auto')
+  if (mode === 'backup-to-cloud' || mode === 'restore-from-cloud' || mode === 'auto') {
+    return mode
+  }
+  return 'auto'
 }
 
 export const getNasSyncScope = async () => {
@@ -260,3 +272,7 @@ export const nasFavoriteAPI = {
 
 export const getPreferredSongListAPI = async () => (await canUseNasSync() ? nasCloudSongListAPI : null)
 export const getPreferredFavoriteAPI = async () => (await canUseNasSync() ? nasFavoriteAPI : null)
+export const getAutoSyncSongListAPI = async () =>
+  (await canUseNasSync()) && (await getNasSyncMode()) === 'auto' ? nasCloudSongListAPI : null
+export const getAutoSyncFavoriteAPI = async () =>
+  (await canUseNasSync()) && (await getNasSyncMode()) === 'auto' ? nasFavoriteAPI : null

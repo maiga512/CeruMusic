@@ -1,9 +1,9 @@
 import songListAPI from '@renderer/api/songList'
 import {
   canUseNasSync,
+  getNasSyncMode,
   getScopedNasSyncLastRevision,
   nasCloudSongListAPI,
-  nasFavoriteAPI,
   nasPlaylistAPI,
   nasSyncAPI,
   setScopedNasSyncLastRevision
@@ -227,6 +227,22 @@ const replaceLocalPlaylistSongs = async (localId: string, remoteSongs: readonly 
   }
 }
 
+const mergeLocalPlaylistSongs = async (localId: string, remoteSongs: readonly any[]) => {
+  const songs = remoteSongs.map((song) => mapCloudSongToLocal(song) as Songs)
+  if (songs.length === 0) return
+
+  const current = await songListAPI.getSongs(localId)
+  const currentIds = new Set(
+    current.success && Array.isArray(current.data)
+      ? current.data.map((song) => String(song.songmid))
+      : []
+  )
+  const shouldAdd = songs.filter((song) => !currentIds.has(String(song.songmid)))
+  if (shouldAdd.length > 0) {
+    await songListAPI.addSongs(localId, shouldAdd)
+  }
+}
+
 const applyRemoteEvent = async (event: NasSyncEvent) => {
   const payload = event.payload || {}
 
@@ -332,56 +348,105 @@ const uploadPlaylistSnapshot = async (playlist: SongList) => {
   return result
 }
 
+const getLocalPlaylistByName = async (name: string) => {
+  const all = await songListAPI.getAll()
+  const playlists = all.success && Array.isArray(all.data) ? all.data : []
+  return playlists.find((playlist) => playlist.name === name)
+}
+
+const restoreRemotePlaylistToLocal = async (remotePlaylist: any) => {
+  const remoteId = String(remotePlaylist.id || remotePlaylist.playlistId || '')
+  if (!remoteId) return null
+
+  const detail = await nasPlaylistAPI.getSongs(remoteId).catch(() => null)
+  const songs = detail?.songs || detail?.list || []
+  const localId = remotePlaylist.localId ? String(remotePlaylist.localId) : undefined
+  const name = remotePlaylist.name || remotePlaylist.title || '未命名歌单'
+  const existing =
+    (await getLocalPlaylistByRemoteId(remoteId, localId)) || (await getLocalPlaylistByName(name))
+
+  if (existing) {
+    await songListAPI.edit(existing.id, {
+      name,
+      description: remotePlaylist.description || remotePlaylist.describe || existing.description || '',
+      coverImgUrl:
+        remotePlaylist.coverImgUrl || remotePlaylist.coverUrl || remotePlaylist.cover || existing.coverImgUrl,
+      source: existing.source,
+      meta: {
+        ...(existing.meta || {}),
+        cloudId: remoteId,
+        localUpdatedAt: remotePlaylist.updatedAt || new Date().toISOString(),
+        ...(remotePlaylist.semanticType ? { semantic: remotePlaylist.semanticType } : {})
+      }
+    })
+    await mergeLocalPlaylistSongs(existing.id, songs)
+    return existing.id
+  }
+
+  const created = await createOrUpdateLocalPlaylist(remotePlaylist)
+  if (created?.id) {
+    await mergeLocalPlaylistSongs(created.id, songs)
+  }
+  return created?.id || null
+}
+
+const backupLocalLibraryToCloud = async (reason: string) => {
+  const localRes = await songListAPI.getAll()
+  const playlists = localRes.success && Array.isArray(localRes.data) ? localRes.data : []
+  let uploaded = 0
+
+  for (const playlist of playlists) {
+    await uploadPlaylistSnapshot(playlist)
+    uploaded += 1
+  }
+
+  const result = await nasSyncAPI.sync(0)
+  if (typeof result.revision === 'number') await setScopedNasSyncLastRevision(result.revision)
+  await appendNasSyncLog(`[备份到云端] ${reason}，已上传 ${uploaded} 个本地歌单`)
+  return { uploaded, revision: result.revision }
+}
+
+const restoreCloudLibraryToLocal = async (reason: string) => {
+  const remotePlaylists = await nasPlaylistAPI.list()
+  let restored = 0
+
+  for (const playlist of Array.isArray(remotePlaylists) ? remotePlaylists : []) {
+    await restoreRemotePlaylistToLocal(playlist)
+    restored += 1
+  }
+
+  const result = await nasSyncAPI.sync(0)
+  if (typeof result.revision === 'number') await setScopedNasSyncLastRevision(result.revision)
+  await appendNasSyncLog(`[从云端恢复] ${reason}，已合并 ${restored} 个云端歌单`)
+  suppressLocalChangeEvents()
+  window.dispatchEvent(new Event('playlist-updated'))
+  return { restored, revision: result.revision }
+}
+
+const runAutoSync = async (reason: string) => {
+  const sinceRevision = await getScopedNasSyncLastRevision()
+  const remoteSnapshot = await nasSyncAPI.sync(sinceRevision)
+  if (Array.isArray(remoteSnapshot.events) && remoteSnapshot.events.length > 0) {
+    await appendNasSyncLogs(remoteSnapshot.events)
+    await applyRemoteEvents(remoteSnapshot.events)
+  }
+  if (typeof remoteSnapshot.revision === 'number') {
+    await setScopedNasSyncLastRevision(remoteSnapshot.revision)
+  }
+  await appendNasSyncLog(`[自动同步] ${reason}，已同步服务器事件`)
+  return { revision: remoteSnapshot.revision }
+}
+
 export const runNasSyncNow = async (reason = 'manual') => {
   if (initialSyncRunning || applyingRemoteEvents || running) return null
   if (!(await canUseNasSync())) return null
 
   initialSyncRunning = true
   try {
-    const remoteSnapshot = await nasSyncAPI.sync(await getScopedNasSyncLastRevision())
-    if (Array.isArray(remoteSnapshot.events) && remoteSnapshot.events.length > 0) {
-      await appendNasSyncLogs(remoteSnapshot.events)
-      await applyRemoteEvents(remoteSnapshot.events)
-      if (typeof remoteSnapshot.revision === 'number') {
-        await setScopedNasSyncLastRevision(remoteSnapshot.revision)
-      }
-    }
-
-    const localRes = await songListAPI.getAll()
-    const playlists = localRes.success && Array.isArray(localRes.data) ? localRes.data : []
-    let uploaded = 0
-
-    for (const playlist of playlists) {
-      await uploadPlaylistSnapshot(playlist)
-      uploaded += 1
-    }
-
-    const favoritesIdRes = await window.api.songList.getFavoritesId().catch(() => null)
-    const favoritesId = favoritesIdRes?.data
-    if (favoritesId) {
-      const latestPlaylistsRes = await songListAPI.getAll()
-      const latestPlaylists =
-        latestPlaylistsRes.success && Array.isArray(latestPlaylistsRes.data)
-          ? latestPlaylistsRes.data
-          : playlists
-      const favorites = latestPlaylists.find((playlist) => playlist.id === favoritesId)
-      if (favorites?.meta?.cloudId) {
-        await nasFavoriteAPI.favoritePlaylist({
-          playlistId: favorites.meta.cloudId,
-          title: favorites.name,
-          description: favorites.description || '',
-          coverUrl: favorites.coverImgUrl,
-          source: favorites.source
-        } as any).catch(() => null)
-      }
-    }
-
-    const result = await nasSyncAPI.sync(0)
-    if (typeof result.revision === 'number') await setScopedNasSyncLastRevision(result.revision)
-    await appendNasSyncLog(`[首轮同步] ${reason}，已上传 ${uploaded} 个本地歌单`)
-    suppressLocalChangeEvents()
-    window.dispatchEvent(new Event('playlist-updated'))
-    return { uploaded, revision: result.revision }
+    const mode = await getNasSyncMode()
+    if (mode === 'backup-to-cloud') return await backupLocalLibraryToCloud(reason)
+    if (mode === 'restore-from-cloud') return await restoreCloudLibraryToLocal(reason)
+    return await runAutoSync(reason)
   } catch (error) {
     await appendNasSyncLog(`[首轮同步失败] ${error instanceof Error ? error.message : String(error)}`, 'error')
     throw error
@@ -396,6 +461,12 @@ const pollNasSync = async () => {
   try {
     if (!(await canUseNasSync())) {
       scheduleNext(BACKGROUND_INTERVAL_MS)
+      return
+    }
+
+    const mode = await getNasSyncMode()
+    if (mode !== 'auto') {
+      scheduleNext()
       return
     }
 
@@ -433,6 +504,8 @@ const flushLocalNasSyncBackup = async () => {
   }
 
   try {
+    const mode = await getNasSyncMode()
+    if (mode === 'restore-from-cloud') return
     await runNasSyncNow('local-change')
   } catch (error) {
     console.warn('[nas-sync] local backup failed:', error)
