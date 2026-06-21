@@ -1,25 +1,25 @@
 /**
- * CeruMusic NAS 同步服务插件
+ * CeruMusic 多端同步服务插件
  *
- * 把部署在 NAS 上的多端同步服务作为澜音服务插件接入。
+ * 把自建部署的多端同步服务作为澜音服务插件接入。
  *
- * @name NAS 多端同步
+ * @name 多端同步
  * @author maiga512
- * @version 1.0.4
- * @description 连接你部署在 NAS 上的同步服务器，用于歌单备份与多端同步
+ * @version 1.0.5
+ * @description 连接你自建部署的同步服务器，用于歌单备份与多端同步
  */
 
 const pluginInfo = {
-  name: 'NAS 多端同步',
-  version: '1.0.4',
+  name: '多端同步',
+  version: '1.0.5',
   author: 'maiga512',
-  description: '连接你部署在 NAS 上的同步服务器，用于歌单备份与多端同步'
+  description: '连接你自建部署的同步服务器，用于歌单备份与多端同步'
 }
 
 const configSchema = [
   {
     key: 'enabled',
-    label: '启用 NAS 同步',
+    label: '启用同步',
     type: 'switch',
     default: false
   },
@@ -36,16 +36,16 @@ const configSchema = [
   },
   {
     key: 'serverUrl',
-    label: 'NAS 同步服务器地址',
+    label: '同步服务器地址',
     type: 'text',
     required: true,
-    placeholder: '填写你部署在 NAS 上的同步服务地址，例如 http://192.168.1.10:31231'
+    placeholder: '填写你自建部署的同步服务地址，例如 http://192.168.1.10:31231'
   },
   {
     key: 'pairCode',
     label: '登录绑定码',
     type: 'text',
-    placeholder: '填写 NAS 管理后台为当前用户生成的长期绑定码'
+    placeholder: '填写管理后台为当前用户生成的长期绑定码'
   }
 ]
 
@@ -55,7 +55,7 @@ function normalizeBaseUrl(serverUrl) {
 
 async function requestNas(config, endpoint, options) {
   const baseUrl = normalizeBaseUrl(config.serverUrl)
-  if (!baseUrl) throw new Error('请先填写 NAS 同步服务器地址')
+  if (!baseUrl) throw new Error('请先填写同步服务器地址')
 
   const opts = options || {}
   const headers = {
@@ -78,21 +78,21 @@ async function requestNas(config, endpoint, options) {
       },
       (error, result) => {
         if (error) {
-          reject(new Error(error.message || 'NAS 同步服务请求失败'))
+          reject(new Error(error.message || '同步服务请求失败'))
           return
         }
         if (!result) {
-          reject(new Error('NAS 同步服务无响应'))
+          reject(new Error('同步服务无响应'))
           return
         }
         if (result.statusCode < 200 || result.statusCode >= 300) {
-          const message = result.body && result.body.error ? result.body.error : 'NAS 同步服务请求失败'
+          const message = result.body && result.body.error ? result.body.error : '同步服务请求失败'
           reject(new Error(message + '：' + result.statusCode))
           return
         }
         const body = result.body
         if (body && body.success === false) {
-          reject(new Error(body.error || 'NAS 同步服务请求失败'))
+          reject(new Error(body.error || '同步服务请求失败'))
           return
         }
         if (body && body.success === true && Object.prototype.hasOwnProperty.call(body, 'data')) {
@@ -112,13 +112,13 @@ async function testConnection(config) {
     }
     if (!config.accessToken) {
       await requestNas(config, '/health', { token: '' })
-      return { success: false, message: '服务器可访问，请先登录 NAS 同步服务' }
+      return { success: false, message: '服务器可访问，请先登录同步服务' }
     }
 
     await requestNas(config, '/me')
-    return { success: true, message: 'NAS 同步服务已连接' }
+    return { success: true, message: '同步服务已连接' }
   } catch (error) {
-    return { success: false, message: error.message || 'NAS 同步服务未连接' }
+    return { success: false, message: error.message || '同步服务未连接' }
   }
 }
 

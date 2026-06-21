@@ -115,7 +115,7 @@
               {{ plugin.pluginInfo.description || '无描述' }}
             </p>
             <p v-if="plugin.serviceRole === 'nas-sync'" class="plugin-note">
-              这是通过 NAS 自建部署的同步服务器插件，用于歌单备份和多端同步；配置时请填写你自己的 NAS 服务地址。
+              这是自建部署的同步服务器插件，用于歌单备份和多端同步；可部署在 NAS、软路由、小服务器或 Docker 面板上。
             </p>
             <div
               v-if="plugin.supportedSources && Object.keys(plugin.supportedSources).length > 0"
@@ -276,12 +276,38 @@
         confirm-btn="保存"
         cancel-btn="取消"
       >
-        <template #header>{{ configPluginName }} - 配置</template>
+        <template #header>{{ isNasSyncConfig ? '多端同步配置' : `${configPluginName} - 配置` }}</template>
         <template #body>
           <div class="config-form">
+            <div v-if="isNasSyncConfig" class="sync-mode-panel">
+              <div class="sync-mode-main">
+                <label class="config-label">同步模式</label>
+                <t-select
+                  v-model="configValues.syncMode"
+                  placeholder="请选择同步模式"
+                  size="medium"
+                >
+                  <t-option
+                    v-for="mode in nasSyncModeOptions"
+                    :key="mode.value"
+                    :value="mode.value"
+                    :label="mode.label"
+                  />
+                </t-select>
+              </div>
+              <t-button
+                theme="primary"
+                size="medium"
+                :loading="configSaving"
+                @click="savePluginConfig"
+              >
+                保存同步设置
+              </t-button>
+            </div>
             <div
               v-for="field in configSchema"
               :key="field.key"
+              v-show="!isNasSyncConfig || field.key !== 'syncMode'"
               class="config-field"
               :class="{ 'config-field-switch': field.type === 'switch' }"
             >
@@ -330,7 +356,7 @@
 
             <div class="config-test">
               <div v-if="isNasSyncConfig" class="nas-sync-status-hint">
-                这是你部署在 NAS 上的同步服务器地址，用于歌单备份和多端同步，不是公共云地址。
+                这是你自建部署的同步服务器地址，可部署在 NAS、软路由、小服务器或 Docker 面板上，用于歌单备份和多端同步，不是公共云地址。
               </div>
               <div
                 v-if="isNasSyncConfig"
@@ -346,7 +372,7 @@
                 :loading="configTesting"
                 @click="loginNasSyncPlugin"
               >
-                登录 NAS 同步服务
+                登录同步服务
               </t-button>
               <t-button
                 theme="default"
@@ -363,7 +389,7 @@
                 :loading="nasSyncRunning"
                 @click="runCurrentNasSyncMode"
               >
-                执行当前同步模式
+                执行当前模式
               </t-button>
               <span
                 v-if="configTestResult"
@@ -491,6 +517,11 @@ const configTestResult = ref<{ success: boolean; message: string } | null>(null)
 const savedConfigSnapshot = ref<Record<string, any>>({})
 const configServiceRole = ref('')
 const isNasSyncConfig = computed(() => configServiceRole.value === 'nas-sync')
+const nasSyncModeOptions = [
+  { label: '备份到云端', value: 'backup-to-cloud' },
+  { label: '从云端恢复到本地', value: 'restore-from-cloud' },
+  { label: '多端自动同步', value: 'auto' }
+]
 const NAS_SYNC_PERSISTED_KEYS = [
   'accessToken',
   'tokenExpiresAt',
@@ -892,6 +923,7 @@ async function openConfigDialog(plugin: Plugin) {
       for (const key of NAS_SYNC_PERSISTED_KEYS) {
         if (savedConfig[key] !== undefined) values[key] = savedConfig[key]
       }
+      if (!values.syncMode) values.syncMode = 'auto'
     }
     configValues.value = values
 
@@ -930,7 +962,7 @@ function buildPluginConfigForSave() {
 
 async function ensureNasSyncSession(reason = 'manual', options: { sync?: boolean } = {}) {
   if (!configValues.value.serverUrl?.trim()) {
-    throw new Error('请先填写 NAS 同步服务器地址')
+    throw new Error('请先填写同步服务器地址')
   }
 
   const currentPairCode =
@@ -952,7 +984,7 @@ async function ensureNasSyncSession(reason = 'manual', options: { sync?: boolean
   })
   const body = await response.json().catch(() => null)
   if (!response.ok || body?.success === false) {
-    throw new Error(body?.error || `NAS 同步服务请求失败：${response.status}`)
+    throw new Error(body?.error || `同步服务请求失败：${response.status}`)
   }
 
   const session = body?.success === true && 'data' in body ? body.data : body
@@ -967,12 +999,12 @@ async function ensureNasSyncSession(reason = 'manual', options: { sync?: boolean
   const plainConfig = buildPluginConfigForSave()
   await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
   savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
-  configTestResult.value = { success: true, message: 'NAS 同步服务已连接' }
+  configTestResult.value = { success: true, message: '同步服务已连接' }
 
   if (plainConfig.enabled && options.sync !== false) {
     runNasSyncNow(reason).catch((error) => {
-      console.error('NAS 首轮同步失败:', error)
-      MessagePlugin.warning(`NAS 已连接，首轮同步失败：${error.message || '未知错误'}`)
+      console.error('同步执行失败:', error)
+      MessagePlugin.warning(`同步服务已连接，执行失败：${error.message || '未知错误'}`)
     })
   }
 
@@ -984,7 +1016,7 @@ async function probeNasSyncConnection(options: { silent?: boolean } = {}) {
   const baseUrl = String(plainConfig.serverUrl || '').trim().replace(/\/+$/, '')
   if (!baseUrl) {
     configValues.value.status = 'disconnected'
-    configTestResult.value = { success: false, message: '请先填写 NAS 同步服务器地址' }
+    configTestResult.value = { success: false, message: '请先填写同步服务器地址' }
     return configTestResult.value
   }
 
@@ -1007,7 +1039,7 @@ async function probeNasSyncConnection(options: { silent?: boolean } = {}) {
         const nextConfig = buildPluginConfigForSave()
         await window.api.plugins.saveConfig(configPluginId.value, nextConfig)
         savedConfigSnapshot.value = JSON.parse(JSON.stringify(nextConfig))
-        configTestResult.value = { success: true, message: 'NAS 同步服务已连接' }
+        configTestResult.value = { success: true, message: '同步服务已连接' }
         return configTestResult.value
       }
     } catch {
@@ -1021,10 +1053,10 @@ async function probeNasSyncConnection(options: { silent?: boolean } = {}) {
   if (pairCode) {
     try {
       await ensureNasSyncSession('probe', { sync: false })
-      return { success: true, message: 'NAS 同步服务已连接' }
+      return { success: true, message: '同步服务已连接' }
     } catch (error: any) {
       configValues.value.status = 'disconnected'
-      configTestResult.value = { success: false, message: error.message || 'NAS 同步服务未连接' }
+      configTestResult.value = { success: false, message: error.message || '同步服务未连接' }
       if (!options.silent) MessagePlugin.error(configTestResult.value.message)
       return configTestResult.value
     }
@@ -1041,15 +1073,15 @@ async function loginNasSyncPlugin() {
   configTestResult.value = null
   try {
     await ensureNasSyncSession('login')
-    MessagePlugin.success('NAS 同步服务已连接')
+    MessagePlugin.success('同步服务已连接')
   } catch (err: any) {
     configValues.value.status = 'disconnected'
     configValues.value.accessToken = ''
     const plainConfig = buildPluginConfigForSave()
     await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
     savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
-    configTestResult.value = { success: false, message: err.message || 'NAS 同步服务连接失败' }
-    MessagePlugin.error(err.message || 'NAS 同步服务连接失败')
+    configTestResult.value = { success: false, message: err.message || '同步服务连接失败' }
+    MessagePlugin.error(err.message || '同步服务连接失败')
   } finally {
     configTesting.value = false
   }
@@ -1137,7 +1169,7 @@ async function runCurrentNasSyncMode() {
   try {
     const plainConfig = buildPluginConfigForSave()
     if (!plainConfig.enabled) {
-      MessagePlugin.warning('请先启用 NAS 同步')
+      MessagePlugin.warning('请先启用同步')
       return
     }
     await window.api.plugins.saveConfig(configPluginId.value, plainConfig)
@@ -1666,6 +1698,22 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.sync-mode-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--plugins-border);
+}
+
+.sync-mode-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
 }
 
 .config-field-switch {
