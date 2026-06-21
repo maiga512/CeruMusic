@@ -1732,7 +1732,7 @@ const handleUploadToCloud = async () => {
     )
     playlistInfo.value.meta = newMeta
   } catch (e: any) {
-    MessagePlugin.error('上传失败: ' + (e.message || '未知错误'))
+    console.error('上传失败:', e)
   }
 }
 
@@ -1750,7 +1750,7 @@ const handleSyncToCloud = async () => {
     )
     playlistInfo.value.meta = newMeta
   } catch (e: any) {
-    MessagePlugin.error('同步失败: ' + (e.message || '未知错误'))
+    console.error('同步失败:', e)
   }
 }
 

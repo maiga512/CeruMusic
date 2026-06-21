@@ -52,6 +52,11 @@ const findCloudMatch = (cloudLists: CloudSongList[], playlist: SongList) => {
   )
 }
 
+const hasCloudPlaylist = (cloudLists: CloudSongList[], cloudId?: string) => {
+  if (!cloudId) return false
+  return cloudLists.some((item) => item.id === cloudId)
+}
+
 const createCloudPlaylist = async (playlist: SongList, songs: readonly Songs[] = []) => {
   const syncAPI = await getSongListSyncAPI()
   const res = await syncAPI.createUserSongList({
@@ -140,8 +145,6 @@ export const ensureCloudPlaylistForLocal = async (playlist: SongList) => {
   if (!(await canUseCloudLibrary())) return null
   if (playlist.meta?.isCloudOnly) return playlist.meta?.cloudId || playlist.id
 
-  if (playlist.meta?.cloudId) return playlist.meta.cloudId as string
-
   try {
     const syncAPI = await getSongListSyncAPI()
     const [cloudLists, songsRes] = await Promise.all([
@@ -149,7 +152,16 @@ export const ensureCloudPlaylistForLocal = async (playlist: SongList) => {
       songListAPI.getSongs(playlist.id)
     ])
     const songs = songsRes.success ? [...(songsRes.data || [])] : []
-    const match = findCloudMatch(Array.isArray(cloudLists) ? cloudLists : [], playlist)
+    const safeCloudLists = Array.isArray(cloudLists) ? cloudLists : []
+    const currentCloudId = playlist.meta?.cloudId ? String(playlist.meta.cloudId) : ''
+
+    if (hasCloudPlaylist(safeCloudLists, currentCloudId)) {
+      const existing = safeCloudLists.find((item) => item.id === currentCloudId)
+      await markPlaylistCloudSyncOk(playlist, currentCloudId, existing?.updatedAt)
+      return currentCloudId
+    }
+
+    const match = findCloudMatch(safeCloudLists, playlist)
 
     if (match) {
       await markPlaylistCloudSyncOk(playlist, match.id, match.updatedAt)

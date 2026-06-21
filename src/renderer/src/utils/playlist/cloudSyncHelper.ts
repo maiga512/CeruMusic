@@ -1,5 +1,6 @@
 import { MessagePlugin } from 'tdesign-vue-next'
 import { cloudSongListAPI } from '@renderer/api/cloudSongList'
+import { getPreferredSongListAPI } from '@renderer/api/nasSync'
 import songListAPI from '@renderer/api/songList'
 import { getPersistentMeta } from '@renderer/utils/playlist/meta'
 import { mapSongsToCloud } from '@renderer/utils/playlist/cloudList'
@@ -13,17 +14,32 @@ export interface PlaylistInfo {
   meta: any
 }
 
+const getSongListSyncAPI = async () => (await getPreferredSongListAPI()) || cloudSongListAPI
+
+const isMissingCloudPlaylistError = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /songlist .*not found|not found|不存在|404/i.test(message)
+}
+
 /**
  * Update local meta after cloud operation
  */
 export async function syncLocalMetaWithCloudUpdate(
   localId: string,
   currentMeta: any,
-  updatedAt: string
+  updatedAt: string,
+  cloudId?: string
 ) {
   const meta = getPersistentMeta({
     ...currentMeta,
-    localUpdatedAt: updatedAt
+    ...(cloudId ? { cloudId } : {}),
+    isSynced: true,
+    cloudUpdatedAt: updatedAt,
+    localUpdatedAt: updatedAt,
+    cloudSyncPending: false,
+    cloudSyncOperation: undefined,
+    cloudSyncError: undefined,
+    cloudSyncFailedAt: undefined
   })
 
   // Preserve playlistId if exists
@@ -45,6 +61,18 @@ export async function syncLocalMetaWithCloudUpdate(
   return meta
 }
 
+const createCloudPlaylistFromLocal = async (playlist: PlaylistInfo, songs: any[], cover: string | File) => {
+  const syncAPI = await getSongListSyncAPI()
+  const res = await syncAPI.createUserSongList({
+    localId: playlist.id,
+    name: playlist.name,
+    describe: playlist.description,
+    cover,
+    songlist: mapSongsToCloud(songs)
+  })
+  return res
+}
+
 /**
  * Upload local playlist to cloud (Create)
  */
@@ -59,18 +87,12 @@ export async function handleUploadToCloudHelper(
       ? base64ToFile(playlist.cover, 'cover.png')
       : playlist.cover
 
-    const res = await cloudSongListAPI.createUserSongList({
-      localId: playlist.id,
-      name: playlist.name,
-      describe: playlist.description,
-      cover: cover,
-      songlist: mapSongsToCloud(songs)
-    })
+    const res = await createCloudPlaylistFromLocal(playlist, songs, cover)
 
     const updatedAt = res.updatedAt
     const cloudId = res.id
 
-    const newMeta = await syncLocalMetaWithCloudUpdate(playlist.id, playlist.meta, updatedAt)
+    const newMeta = await syncLocalMetaWithCloudUpdate(playlist.id, playlist.meta, updatedAt, cloudId)
 
     // Return updated meta including in-memory cloudUpdatedAt and isSynced
     const resultMeta = {
@@ -113,24 +135,38 @@ export async function handleSyncToCloudHelper(
       ? base64ToFile(playlist.cover, 'cover.png')
       : playlist.cover
 
-    const updateRes: any = await cloudSongListAPI.updateUserSongList({
-      listId: playlist.meta.cloudId,
-      name: playlist.name,
-      describe: playlist.description,
-      cover: cover,
-      songlist: mapSongsToCloud(songs)
-    })
+    const syncAPI = await getSongListSyncAPI()
+    let cloudId = playlist.meta.cloudId
+    let updateRes: any
+
+    try {
+      updateRes = await syncAPI.updateUserSongList({
+        listId: cloudId,
+        localId: playlist.id,
+        name: playlist.name,
+        describe: playlist.description,
+        cover: cover,
+        songlist: mapSongsToCloud(songs)
+      })
+    } catch (error) {
+      if (!isMissingCloudPlaylistError(error)) throw error
+      const created = await createCloudPlaylistFromLocal(playlist, songs, cover)
+      cloudId = created.id
+      updateRes = created
+      MessagePlugin.warning('云端原歌单不存在，已用本地歌单重新建立同步副本')
+    }
 
     loadingMsg.then((inst) => inst.close())
     MessagePlugin.success('同步成功')
 
     const newTimestamp = updateRes?.updatedAt || new Date().toISOString()
 
-    const newMeta = await syncLocalMetaWithCloudUpdate(playlist.id, playlist.meta, newTimestamp)
+    const newMeta = await syncLocalMetaWithCloudUpdate(playlist.id, playlist.meta, newTimestamp, cloudId)
 
     const resultMeta = {
       ...playlist.meta,
       ...newMeta,
+      cloudId,
       cloudUpdatedAt: newTimestamp
     }
 
