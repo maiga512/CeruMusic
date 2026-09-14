@@ -15,6 +15,7 @@ import {
 import {
   ensureCloudPlaylistForLocal,
   syncAddSongsToCloud,
+  syncPlaylistSongsSnapshotToCloud,
   syncRemoveSongsFromCloud
 } from '@renderer/utils/playlist/cloudLibrarySync'
 import { NIcon } from 'naive-ui'
@@ -1050,6 +1051,15 @@ const handleMoveToPosition = (song: MusicItem) => {
             MessagePlugin.error(res.error || '排序失败')
             return
           }
+          try {
+            await syncPlaylistSongsSnapshotToCloud(
+              getCurrentPlaylistForCloudBinding(),
+              next as any[]
+            )
+          } catch (error) {
+            console.warn('同步歌单顺序到云端失败:', error)
+            MessagePlugin.warning('本地顺序已更新，但云端顺序同步失败')
+          }
           MessagePlugin.success(`已移动到第 ${toVis + 1} 位`)
         } catch (e: any) {
           songs.value = prev
@@ -1077,6 +1087,15 @@ const handleMoveToPosition = (song: MusicItem) => {
             songs.value = prev
             MessagePlugin.error(res.error || '排序失败')
             return
+          }
+          try {
+            await syncPlaylistSongsSnapshotToCloud(
+              getCurrentPlaylistForCloudBinding(),
+              finalOrder as any[]
+            )
+          } catch (error) {
+            console.warn('同步歌单顺序到云端失败:', error)
+            MessagePlugin.warning('本地顺序已更新，但云端顺序同步失败')
           }
           MessagePlugin.success(`已移动到第 ${toVis + 1} 位`)
         } catch (e: any) {

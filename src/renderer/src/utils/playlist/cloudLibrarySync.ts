@@ -246,6 +246,36 @@ export const syncRemoveSongsFromCloud = async (
   }
 }
 
+export const syncPlaylistSongsSnapshotToCloud = async (
+  playlist: SongList,
+  songs: readonly Songs[]
+) => {
+  if (!(await canUseCloudLibrary())) return null
+  if (isBridgedPlaylist(playlist, songs)) return null
+
+  try {
+    const cloudId = await ensureCloudPlaylistForLocal(playlist)
+    if (!cloudId) return null
+    const syncAPI = await getSongListSyncAPI()
+    const res = await syncAPI.updateUserSongList({
+      listId: cloudId,
+      localId: playlist.id,
+      name: playlist.name,
+      describe: playlist.description || '',
+      cover:
+        playlist.coverImgUrl && playlist.coverImgUrl !== 'default-cover'
+          ? playlist.coverImgUrl
+          : undefined,
+      songlist: mapSongsToCloud(songs, true)
+    })
+    await markPlaylistCloudSyncOk(playlist, cloudId, res.updatedAt)
+    return res
+  } catch (error) {
+    await markPlaylistCloudSyncFailed(playlist, 'replaceSongs', error)
+    throw error
+  }
+}
+
 export const syncPlaylistInfoToCloud = async (playlist: SongList) => {
   if (!(await canUseCloudLibrary())) return null
 
