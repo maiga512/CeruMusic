@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { ref, onMounted, computed, toRaw, h, nextTick, type Component } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, toRaw, h, nextTick, type Component } from 'vue'
 import { useRouter } from 'vue-router'
 import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import { NIcon, NDropdown } from 'naive-ui'
@@ -31,6 +31,7 @@ import {
 } from '@renderer/api/cloudSongList'
 import { getAutoSyncSongListAPI, getPreferredSongListAPI } from '@renderer/api/nasSync'
 import { getPersistentMeta } from '@renderer/utils/playlist/meta'
+import { isBridgedRemotePlaylist } from '@renderer/utils/playlist/bridgedPlaylist'
 import { CloudIcon, CloudUploadIcon, CloudDownloadIcon } from 'tdesign-icons-vue-next'
 import { mapCloudSongToLocal } from '@renderer/utils/playlist/cloudList'
 import {
@@ -308,7 +309,9 @@ const loadPlaylists = async () => {
     const [localRes, cloudResult] = await Promise.all([songListAPI.getAll(), getCloudSongList()])
 
     const localLists = (localRes.success ? localRes.data : []) || []
-    const cloudLists: CloudSongList[] = Array.isArray(cloudResult.lists) ? cloudResult.lists : []
+    const cloudLists: CloudSongList[] = Array.isArray(cloudResult.lists)
+      ? cloudResult.lists.filter((item) => !isBridgedRemotePlaylist(item))
+      : []
 
     console.log('Local Lists:', localLists)
     console.log('Cloud Lists:', cloudLists)
@@ -1653,6 +1656,7 @@ const closeContextMenu = () => {
 // 滚动位置保持
 const scrollRef = ref<HTMLElement>()
 const scrollTop = ref(0)
+let unsubscribePlaylistSync: (() => void) | null = null
 let cloudFavoritesPulling = false
 
 const refreshPlaylistsWithCloudFavorites = async () => {
@@ -1678,6 +1682,9 @@ onMounted(() => {
   document.addEventListener('visibilitychange', handleDesktopLibraryResume)
   window.addEventListener('focus', refreshPlaylistsWithCloudFavorites)
   window.addEventListener('playlist-updated', refreshPlaylistsWithCloudFavorites)
+  unsubscribePlaylistSync = window.api.plugins.onPlaylistsSynced(() => {
+    void refreshPlaylistsWithCloudFavorites()
+  })
   // 监听页面滚动，关闭右键菜单
   nextTick(() => {
     if (scrollRef.value) {
@@ -1690,6 +1697,8 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', handleDesktopLibraryResume)
   window.removeEventListener('focus', refreshPlaylistsWithCloudFavorites)
   window.removeEventListener('playlist-updated', refreshPlaylistsWithCloudFavorites)
+  unsubscribePlaylistSync?.()
+  unsubscribePlaylistSync = null
   if (scrollRef.value) {
     scrollRef.value.removeEventListener('scroll', handleScrollCloseMenu)
   }

@@ -52,7 +52,11 @@ type OutboundMsg =
       type: 'error'
       error: { name: string; message: string; stack?: string; method?: string }
     }
-  | { type: 'log'; level: 'log' | 'info' | 'warn' | 'error' | 'debug' | 'group' | 'groupEnd'; args: any[] }
+  | {
+      type: 'log'
+      level: 'log' | 'info' | 'warn' | 'error' | 'debug' | 'group' | 'groupEnd'
+      args: any[]
+    }
   | { type: 'notice'; noticeType: string; data: any }
   | { type: 'throttle'; reason: string; duration?: number }
   | { type: 'heartbeat'; ts: number }
@@ -60,6 +64,7 @@ type OutboundMsg =
 function send(msg: OutboundMsg): void {
   port.postMessage(msg)
 }
+
 
 // ==================== 速率限制 ====================
 // 防御插件 log/notice 死循环把主进程 IPC 队列打爆。
@@ -163,6 +168,7 @@ function buildCerumusicApi(): any {
         return Buffer.concat([encrypted, cipher.final()])
       },
       md5: (str: string) => crypto.createHash('md5').update(str).digest('hex'),
+      sha256: (str: string) => crypto.createHash('sha256').update(str).digest('hex'),
       randomBytes: (size: number) => crypto.randomBytes(size),
       rsaEncrypt: (data: string, key: string) => {
         const encrypted = crypto.publicEncrypt(
@@ -193,7 +199,7 @@ function buildCerumusicApi(): any {
         response.headers.forEach((value, key) => {
           headers[key] = value
         })
-        return { body, statusCode: response.status, headers }
+        return { body, statusCode: response.status, headers, url: response.url }
       } catch (err: any) {
         clearTimeout(timer)
         const isTimeout = err?.name === 'AbortError'
@@ -452,7 +458,8 @@ function initSandbox(pluginCode: string): {
     sources: safeSerialize(pluginExports.sources) || [],
     pluginType,
     configSchema: safeSerialize(pluginExports.configSchema) || [],
-    serviceRole: typeof pluginExports.serviceRole === 'string' ? pluginExports.serviceRole : undefined,
+    serviceRole:
+      typeof pluginExports.serviceRole === 'string' ? pluginExports.serviceRole : undefined,
     hasMethods: {
       musicUrl: typeof pluginExports.musicUrl === 'function',
       getPic: typeof pluginExports.getPic === 'function',

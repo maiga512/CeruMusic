@@ -1,16 +1,25 @@
 import songListAPI from '@renderer/api/songList'
 import { MessagePlugin } from 'tdesign-vue-next'
 import {
+  backupLocalPodcastFavoritesToCloud,
   canUseNasSync,
+  flushPendingPodcastFavoriteMutations,
   getNasSyncMode,
   getScopedNasSyncLastRevision,
   nasCloudSongListAPI,
   nasPlaylistAPI,
   nasSyncAPI,
+  replaceLocalPodcastFavoritesFromCloud,
+  setPodcastFavoriteFromSyncEvent,
   setScopedNasSyncLastRevision
 } from '@renderer/api/nasSync'
-import { ControlAudioStore } from '@renderer/store/ControlAudio'
 import { isAppWindowVisible } from '@renderer/utils/appWindowState'
+import {
+  isBridgedPlaylist,
+  isBridgedRemotePlaylist,
+  isLocalBridgedMirror,
+  isStaleBridgedCloudCopy
+} from '@renderer/utils/playlist/bridgedPlaylist'
 import { mapCloudSongToLocal, mapSongsToCloud } from '@renderer/utils/playlist/cloudList'
 import {
   ensureLocalFavoritesPlaylist,
@@ -18,11 +27,12 @@ import {
 } from '@renderer/utils/playlist/cloudLibrarySync'
 import type { SongList, Songs } from '@common/types/songList'
 
-const ACTIVE_INTERVAL_MS = 60_000
+const ACTIVE_FALLBACK_INTERVAL_MS = 2_000
 const BACKGROUND_INTERVAL_MS = 300_000
+const LONG_POLL_TIMEOUT_MS = 5_000
 const ERROR_BACKOFF_MS = 120_000
 const OFFLINE_BACKOFF_MS = 300_000
-const LOCAL_CHANGE_DEBOUNCE_MS = 5_000
+const LOCAL_CHANGE_DEBOUNCE_MS = 750
 const NAS_SYNC_SERVICE_NAME = 'NAS 多端同步'
 
 let timer: number | null = null
@@ -64,10 +74,8 @@ const suppressLocalChangeEvents = () => {
 }
 
 const getNextInterval = () => {
-  const audioStore = ControlAudioStore()
   if (!isAppWindowVisible()) return BACKGROUND_INTERVAL_MS
-  if (audioStore.Audio.isPlay) return ACTIVE_INTERVAL_MS
-  return ACTIVE_INTERVAL_MS
+  return ACTIVE_FALLBACK_INTERVAL_MS
 }
 
 const scheduleNext = (delay = getNextInterval()) => {
@@ -113,10 +121,12 @@ const summarizeNasSyncEvent = (event: NasSyncEvent) => {
   }
 
   if (event.entityType === 'favorite') {
+    const isPodcast = payload.entityType === 'podcast'
+    const label = isPodcast ? '播客收藏' : '收藏歌单'
     if (event.action === 'delete') {
-      return `[同步事件 ${revisionText}] 收藏歌单已取消收藏`
+      return `[同步事件 ${revisionText}] ${label}已取消收藏`
     }
-    return `[同步事件 ${revisionText}] 收藏歌单已同步`
+    return `[同步事件 ${revisionText}] ${label}已同步`
   }
 
   return `[同步事件 ${revisionText}] ${event.entityType || 'unknown'}:${event.action || 'unknown'}`
@@ -250,20 +260,26 @@ const replaceLocalPlaylistSongs = async (localId: string, remoteSongs: readonly 
   }
 }
 
-const mergeLocalPlaylistSongs = async (localId: string, remoteSongs: readonly any[]) => {
-  const songs = remoteSongs.map((song) => mapCloudSongToLocal(song) as Songs)
-  if (songs.length === 0) return
+const clearPlaylistCloudBinding = async (playlist: SongList) => {
+  const meta = { ...(playlist.meta || {}) }
+  delete meta.cloudId
+  delete meta.cloudUpdatedAt
+  delete meta.cloudSyncPending
+  delete meta.cloudSyncOperation
+  delete meta.cloudSyncError
+  delete meta.cloudSyncFailedAt
+  delete meta.isCloudOnly
+  await songListAPI.edit(playlist.id, { meta })
+}
 
-  const current = await songListAPI.getSongs(localId)
-  const currentIds = new Set(
-    current.success && Array.isArray(current.data)
-      ? current.data.map((song) => String(song.songmid))
-      : []
-  )
-  const shouldAdd = songs.filter((song) => !currentIds.has(String(song.songmid)))
-  if (shouldAdd.length > 0) {
-    await songListAPI.addSongs(localId, shouldAdd)
+const discardStaleBridgedCloudCopy = async (remoteId: string, localId?: string) => {
+  const existing = await getLocalPlaylistByRemoteId(remoteId, localId)
+  if (!existing) return
+  if (isLocalBridgedMirror(existing)) {
+    await clearPlaylistCloudBinding(existing)
+    return
   }
+  await songListAPI.delete(existing.id)
 }
 
 const applyRemoteEvent = async (event: NasSyncEvent) => {
@@ -273,9 +289,22 @@ const applyRemoteEvent = async (event: NasSyncEvent) => {
     const remoteId = String(payload.id || event.entityId || '')
     if (!remoteId) return
 
+    if (isBridgedRemotePlaylist(payload)) {
+      if (event.action === 'delete') {
+        await discardStaleBridgedCloudCopy(remoteId, payload.localId)
+      }
+      return
+    }
+
     const existing = await getLocalPlaylistByRemoteId(remoteId, payload.localId)
     if (event.action === 'delete') {
-      if (existing) await songListAPI.delete(existing.id)
+      if (existing) {
+        if (isLocalBridgedMirror(existing)) {
+          await clearPlaylistCloudBinding(existing)
+        } else {
+          await songListAPI.delete(existing.id)
+        }
+      }
       return
     }
 
@@ -295,6 +324,11 @@ const applyRemoteEvent = async (event: NasSyncEvent) => {
     const detail = await nasPlaylistAPI.getSongs(remoteId).catch(() => null)
     const songs = detail?.songs || detail?.list || payload.songs || []
     await replaceLocalPlaylistSongs(existing.id, songs)
+    return
+  }
+
+  if (event.entityType === 'favorite' && payload.entityType === 'podcast') {
+    setPodcastFavoriteFromSyncEvent(payload, event.action === 'delete')
     return
   }
 
@@ -328,6 +362,7 @@ const uploadPlaylistSnapshot = async (playlist: SongList) => {
   if (playlist.meta?.isCloudOnly) return null
   const songsRes = await songListAPI.getSongs(playlist.id)
   const songs = songsRes.success && Array.isArray(songsRes.data) ? songsRes.data : []
+  if (isBridgedPlaylist(playlist, songs)) return null
   const semanticType = playlist.meta?.semantic === 'favorites' ? 'favorites' : playlist.meta?.semantic
   let remoteId = playlist.meta?.cloudId
 
@@ -353,7 +388,7 @@ const uploadPlaylistSnapshot = async (playlist: SongList) => {
       cover: playlist.coverImgUrl && playlist.coverImgUrl !== 'default-cover' ? playlist.coverImgUrl : undefined,
       source: playlist.source,
       semanticType,
-      songlist: mapSongsToCloud(songs)
+      songlist: mapSongsToCloud(songs, true)
     })
     await markPlaylistCloudSyncOk(playlist, remoteId, result.updatedAt)
     return result
@@ -365,7 +400,7 @@ const uploadPlaylistSnapshot = async (playlist: SongList) => {
     describe: playlist.description || '',
     cover: playlist.coverImgUrl && playlist.coverImgUrl !== 'default-cover' ? playlist.coverImgUrl : undefined,
     semanticType,
-    songlist: mapSongsToCloud(songs)
+    songlist: mapSongsToCloud(songs, true)
   } as any)
   await markPlaylistCloudSyncOk(playlist, result.id, result.updatedAt)
   return result
@@ -402,51 +437,103 @@ const restoreRemotePlaylistToLocal = async (remotePlaylist: any) => {
         ...(remotePlaylist.semanticType ? { semantic: remotePlaylist.semanticType } : {})
       }
     })
-    await mergeLocalPlaylistSongs(existing.id, songs)
+    await replaceLocalPlaylistSongs(existing.id, songs)
     return existing.id
   }
 
   const created = await createOrUpdateLocalPlaylist(remotePlaylist)
   if (created?.id) {
-    await mergeLocalPlaylistSongs(created.id, songs)
+    await replaceLocalPlaylistSongs(created.id, songs)
   }
   return created?.id || null
 }
 
 const backupLocalLibraryToCloud = async (reason: string) => {
+  await flushPendingPodcastFavoriteMutations()
+  const podcastResult = await backupLocalPodcastFavoritesToCloud()
   const localRes = await songListAPI.getAll()
   const playlists = localRes.success && Array.isArray(localRes.data) ? localRes.data : []
   let uploaded = 0
 
   for (const playlist of playlists) {
-    await uploadPlaylistSnapshot(playlist)
-    uploaded += 1
+    const result = await uploadPlaylistSnapshot(playlist)
+    if (result) uploaded += 1
   }
 
   const result = await nasSyncAPI.sync(0)
   if (typeof result.revision === 'number') await setScopedNasSyncLastRevision(result.revision)
-  await appendNasSyncLog(`[备份到云端] ${reason}，已上传 ${uploaded} 个本地歌单`)
-  return { uploaded, revision: result.revision }
+  await appendNasSyncLog(
+    `[备份到云端] ${reason}，已上传 ${uploaded} 个本地歌单、${podcastResult.uploaded} 个播客收藏`
+  )
+  return { uploaded, podcastUploaded: podcastResult.uploaded, revision: result.revision }
 }
 
 const restoreCloudLibraryToLocal = async (reason: string) => {
   const remotePlaylists = await nasPlaylistAPI.list()
   let restored = 0
+  const restoredLocalIds = new Set<string>()
+  const restoredCloudIds = new Set<string>()
+  let removedBridgedCopies = 0
 
   for (const playlist of Array.isArray(remotePlaylists) ? remotePlaylists : []) {
-    await restoreRemotePlaylistToLocal(playlist)
+    if (isBridgedRemotePlaylist(playlist)) {
+      const remoteId = String(playlist?.id || '')
+      if (remoteId) {
+        const existing = await getLocalPlaylistByRemoteId(remoteId, playlist.localId)
+        if (existing) {
+          if (isLocalBridgedMirror(existing)) {
+            await clearPlaylistCloudBinding(existing)
+          } else {
+            await songListAPI.delete(existing.id)
+            removedBridgedCopies += 1
+          }
+        }
+      }
+      continue
+    }
+
+    const localId = await restoreRemotePlaylistToLocal(playlist)
+    if (localId) restoredLocalIds.add(localId)
+    const cloudId = String(playlist?.id || '')
+    if (cloudId) restoredCloudIds.add(cloudId)
     restored += 1
   }
 
+  // 恢复模式是完整镜像：删除本地独有歌单，但保留飞牛 NAS 曲库的本地镜像。
+  const localRes = await songListAPI.getAll()
+  const localPlaylists = localRes.success && Array.isArray(localRes.data) ? localRes.data : []
+  let removed = 0
+  for (const local of localPlaylists) {
+    if (isLocalBridgedMirror(local)) {
+      if (local.meta?.cloudId) await clearPlaylistCloudBinding(local)
+      continue
+    }
+    if (isStaleBridgedCloudCopy(local)) {
+      await songListAPI.delete(local.id)
+      removedBridgedCopies += 1
+      continue
+    }
+    if (restoredLocalIds.has(local.id)) continue
+    if (local.meta?.cloudId && restoredCloudIds.has(String(local.meta.cloudId))) continue
+    await songListAPI.delete(local.id)
+    removed += 1
+  }
+
+  const podcastItems = await replaceLocalPodcastFavoritesFromCloud()
   const result = await nasSyncAPI.sync(0)
   if (typeof result.revision === 'number') await setScopedNasSyncLastRevision(result.revision)
-  await appendNasSyncLog(`[从云端恢复] ${reason}，已合并 ${restored} 个云端歌单`)
+  await appendNasSyncLog(
+    `[从云端恢复] ${reason}，已镜像 ${restored} 个云端歌单，删除 ${removed} 个本地独有歌单，清理 ${removedBridgedCopies} 个飞牛云端副本，恢复 ${podcastItems.length} 个播客收藏`
+  )
   suppressLocalChangeEvents()
   window.dispatchEvent(new Event('playlist-updated'))
-  return { restored, revision: result.revision }
+  window.dispatchEvent(new Event('ceru-podcast-favorites-updated'))
+  return { restored, removed, removedBridgedCopies, podcasts: podcastItems.length, revision: result.revision }
 }
 
 const runAutoSync = async (reason: string) => {
+  await flushPendingPodcastFavoriteMutations()
+  await cleanupStaleBridgedCloudCopies()
   const sinceRevision = await getScopedNasSyncLastRevision()
   const remoteSnapshot = await nasSyncAPI.sync(sinceRevision)
   if (Array.isArray(remoteSnapshot.events) && remoteSnapshot.events.length > 0) {
@@ -458,6 +545,20 @@ const runAutoSync = async (reason: string) => {
   }
   await appendNasSyncLog(`[自动同步] ${reason}，已同步服务器事件`)
   return { revision: remoteSnapshot.revision }
+}
+
+const cleanupStaleBridgedCloudCopies = async () => {
+  const localRes = await songListAPI.getAll()
+  const playlists = localRes.success && Array.isArray(localRes.data) ? localRes.data : []
+  for (const playlist of playlists) {
+    if (isLocalBridgedMirror(playlist)) {
+      if (playlist.meta?.cloudId) await clearPlaylistCloudBinding(playlist)
+      continue
+    }
+    if (isStaleBridgedCloudCopy(playlist)) {
+      await songListAPI.delete(playlist.id)
+    }
+  }
 }
 
 export const runNasSyncNow = async (reason = 'manual') => {
@@ -497,7 +598,10 @@ const pollNasSync = async () => {
     }
 
     const sinceRevision = await getScopedNasSyncLastRevision()
-    const result = await nasSyncAPI.sync(sinceRevision)
+    const visible = isAppWindowVisible()
+    const result = visible && !syncServerOffline
+      ? await nasSyncAPI.waitForSync(sinceRevision, LONG_POLL_TIMEOUT_MS)
+      : await nasSyncAPI.sync(sinceRevision)
     await markNasSyncOnline()
     if (typeof result.revision === 'number') {
       await setScopedNasSyncLastRevision(result.revision)

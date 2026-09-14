@@ -1,7 +1,11 @@
 # 发版指南 (Release Workflow)
 
+> 本地构建、包体检查和“打包后 2 GB”故障排查请先阅读仓库根目录的
+> [`BUILDING.md`](https://github.com/timeshiftsauce/CeruMusic/blob/main/BUILDING.md)。
+
 > 本仓库使用 `CHANGELOG.md` 作为发版唯一事实源。发布流程已与 CI 打通,
 > 推送一个符合规范的 git tag,CI 会自动:
+>
 > 1. 跨平台构建 (Windows / macOS x64 / macOS arm64 / Linux)
 > 2. 从 `CHANGELOG.md` 抽取当前 tag 对应版本块作为 Release body
 > 3. 创建 GitHub Release 并上传所有产物
@@ -20,11 +24,11 @@ git pull --rebase     # 与远端 main 对齐
 
 遵循 [SemVer](https://semver.org/lang/zh-CN/):
 
-| 改动类型 | 升级位 | 示例 |
-| --- | --- | --- |
-| 新增大功能 (向后兼容) | minor | `1.13.0 → 1.14.0` |
-| 小修复 / 微优化 | patch | `1.14.0 → 1.14.1` |
-| 不兼容改动 (协议变化等) | major | `1.x → 2.0.0` |
+| 改动类型                | 升级位 | 示例              |
+| ----------------------- | ------ | ----------------- |
+| 新增大功能 (向后兼容)   | minor  | `1.13.0 → 1.14.0` |
+| 小修复 / 微优化         | patch  | `1.14.0 → 1.14.1` |
+| 不兼容改动 (协议变化等) | major  | `1.x → 2.0.0`     |
 
 ## 2. 更新 `package.json` 与 `CHANGELOG.md`
 
@@ -32,7 +36,7 @@ git pull --rebase     # 与远端 main 对齐
 
 ```jsonc
 {
-  "version": "1.14.0"   // 改成新版本
+  "version": "1.14.0" // 改成新版本
 }
 ```
 
@@ -46,6 +50,7 @@ git pull --rebase     # 与远端 main 对齐
 简短的介绍段落 (1-3 句)。
 
 ### ✨ 新增 / 🔧 优化 / 🐛 修复
+
 - 功能点 1 (含入口路径: 设置 → XXX)
 - 功能点 2
 ```
@@ -146,6 +151,7 @@ awk -v tag="$TAG_NAME" '
 ```
 
 含义:
+
 - 扫描每一行,遇到 `## [` 开头的标题行
 - 如果当前不在块内,且这个标题包含 `[<tag>]`,从下一行开始进入"打印模式"
 - 再次遇到 `## [` 开头的行 → 退出 (上一个版本块结束)

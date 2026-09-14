@@ -10,6 +10,9 @@ import {
   Menu,
   desktopCapturer,
   session,
+  systemPreferences,
+  dialog,
+  protocol,
   nativeImage,
   clipboard,
   type WebContents,
@@ -22,6 +25,8 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/logo.png?asset'
 import path from 'node:path'
 import InitEventServices from './events'
+import { markPluginSystemInitialized, syncConfiguredFeiniuOnStartup } from './events/plugins'
+import pluginService from './services/plugin/index'
 
 import './events/musicCache'
 import './events/musicUrlCache'
@@ -42,6 +47,20 @@ import {
   consumePendingPlaylistShareIds,
   consumePendingLtCodes
 } from './router/routes'
+import type {
+  AppPlatform,
+  MediaPermissionKind,
+  MediaPermissionStatus,
+  PermissionGuideTarget
+} from '../common/types/permissions'
+
+// 服务插件取流使用主进程代理，保留 Cookie/访问码且允许音频 Range 请求。
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'cerumusic-service',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
+  }
+])
 
 // Initialize deep link routes
 setupDeepLinks()
@@ -52,6 +71,7 @@ const MEDIA_CAPTURE_REQUEST_BUDGET = 4
 
 type MediaCaptureGrant = {
   expiresAt: number
+  kind: MediaPermissionKind
   allowScreenSourceLookup: boolean
   remainingMediaRequests: number
 }
@@ -81,9 +101,13 @@ const isMainWindowWebContents = (webContents: WebContents | null | undefined): b
   )
 }
 
-const authorizeMediaCaptureForWebContents = (webContentsId: number): void => {
+const authorizeMediaCaptureForWebContents = (
+  webContentsId: number,
+  kind: MediaPermissionKind
+): void => {
   mediaCaptureGrants.set(webContentsId, {
     expiresAt: Date.now() + MEDIA_CAPTURE_GRANT_TTL_MS,
+    kind,
     allowScreenSourceLookup: true,
     remainingMediaRequests: MEDIA_CAPTURE_REQUEST_BUDGET
   })
@@ -112,6 +136,104 @@ const consumeMediaPermissionGrant = (webContentsId: number): boolean => {
     mediaCaptureGrants.delete(webContentsId)
   }
   return true
+}
+
+const mediaPermissionRequestMatchesGrant = (
+  grant: MediaCaptureGrant,
+  details: Electron.MediaAccessPermissionRequest
+): boolean => {
+  const mediaTypes = Array.isArray(details?.mediaTypes) ? details.mediaTypes : []
+  if (grant.kind === 'microphone') {
+    return mediaTypes.includes('audio') && !mediaTypes.includes('video')
+  }
+  return mediaTypes.includes('audio') && mediaTypes.includes('video')
+}
+
+const getAppPlatform = (): AppPlatform => {
+  if (
+    process.platform === 'darwin' ||
+    process.platform === 'win32' ||
+    process.platform === 'linux'
+  ) {
+    return process.platform
+  }
+  return 'other'
+}
+
+const getMediaPermissionStatus = (kind: MediaPermissionKind): MediaPermissionStatus => {
+  if (process.platform !== 'darwin') return 'unknown'
+  return systemPreferences.getMediaAccessStatus(kind === 'microphone' ? 'microphone' : 'screen')
+}
+
+const getPermissionSettingsUrl = (target: PermissionGuideTarget): string | null => {
+  if (!['microphone', 'screen-recording', 'files-and-folders'].includes(target)) {
+    return null
+  }
+
+  if (process.platform === 'darwin') {
+    if (target === 'microphone') {
+      return 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
+    }
+    if (target === 'screen-recording') {
+      return 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
+    }
+    return 'x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders'
+  }
+
+  if (process.platform === 'win32') {
+    if (target === 'microphone') return 'ms-settings:privacy-microphone'
+    if (target === 'files-and-folders') return 'ms-settings:privacy-broadfilesystemaccess'
+  }
+
+  return null
+}
+
+const openPermissionSettings = async (target: PermissionGuideTarget): Promise<boolean> => {
+  const url = getPermissionSettingsUrl(target)
+  if (!url) return false
+  try {
+    await shell.openExternal(url)
+    return true
+  } catch (error) {
+    console.warn(`Failed to open permission settings for ${target}:`, error)
+    return false
+  }
+}
+
+const showPermissionGuide = async (target: PermissionGuideTarget): Promise<boolean> => {
+  if (!getPermissionSettingsUrl(target)) return false
+
+  const content = {
+    microphone: {
+      title: '需要麦克风权限',
+      message: '听歌识曲需要使用麦克风采集周围的声音。',
+      detail: '澜音只会在你点击识曲后录音；权限被拒绝后不会再重复弹窗。'
+    },
+    'screen-recording': {
+      title: '需要系统音频录制权限',
+      message: '识别电脑正在播放的声音需要 macOS 的“屏幕与系统音频录制”权限。',
+      detail: '请在系统设置中勾选澜音。授权后可能需要重新启动应用才会生效。'
+    },
+    'files-and-folders': {
+      title: '需要文件访问权限',
+      message: '所选音乐文件夹当前无法读取。',
+      detail: '请在系统设置中允许澜音访问对应文件夹，或返回应用重新选择目录。'
+    }
+  }[target]
+
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    title: content.title,
+    message: content.message,
+    detail: content.detail,
+    buttons: ['打开系统设置', '取消'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true
+  })
+
+  if (response !== 0) return false
+  return openPermissionSettings(target)
 }
 
 const queueOpenPlaylist = (filePath: string) => {
@@ -203,9 +325,16 @@ const sendMainWindowState = (): void => {
 
 const bindMainWindowStateEvents = (win: BrowserWindow): void => {
   const push = () => sendMainWindowState()
-  ;['show', 'hide', 'minimize', 'restore', 'focus', 'blur', 'enter-full-screen', 'leave-full-screen'].forEach(
-    (eventName) => win.on(eventName as any, push)
-  )
+  ;[
+    'show',
+    'hide',
+    'minimize',
+    'restore',
+    'focus',
+    'blur',
+    'enter-full-screen',
+    'leave-full-screen'
+  ].forEach((eventName) => win.on(eventName as any, push))
 }
 
 const sendPlaybackControl = (channel: 'toggle' | 'playPrev' | 'playNext'): void => {
@@ -467,7 +596,10 @@ function toggleAppFullScreen(win: BrowserWindow | null): void {
 }
 
 import { downloadManager } from './services/DownloadManager'
-import pluginService from './services/plugin/index'
+import {
+  registerServiceStreamProtocol,
+  createServiceStreamUrl
+} from './services/plugin/serviceStream'
 import musicSdkService from './services/musicSdk/service'
 import { musicCacheService } from './services/musicCache'
 
@@ -482,21 +614,30 @@ function setupDownloadManager() {
     if (!usePlugin) throw new Error('Plugin not found')
 
     const source = task.songInfo.source
+    const isServicePlugin = pluginService.getServiceRole(task.pluginId) === 'feiniu'
     const songId = `${task.songInfo.name}-${task.songInfo.singer}-${source}-${task.quality}`
 
-    // Check cache
-    const cachedUrl = await musicCacheService.getCachedMusicUrl(songId)
+    // 服务插件取流必须每次经过主进程代理，不能复用裸 URL。
+    const cachedUrl = isServicePlugin ? null : await musicCacheService.getCachedMusicUrl(songId)
     if (cachedUrl) return cachedUrl
 
     // Fetch from plugin
-    const originalUrl = await usePlugin.getMusicUrl(source, task.songInfo, task.quality)
-    if (typeof originalUrl === 'object')
+    const originalUrl = await usePlugin.getMusicUrl(
+      source,
+      task.songInfo,
+      task.quality,
+      pluginService.getConfig(task.pluginId)
+    )
+    const playableUrl = createServiceStreamUrl(originalUrl) || originalUrl
+    if (typeof playableUrl !== 'string')
       throw new Error('Failed to get URL: ' + JSON.stringify(originalUrl))
 
-    // Cache result
-    musicCacheService.cacheMusic(songId, originalUrl).catch(console.error)
+    // 服务插件地址带有主进程代理状态，不能写入持久缓存。
+    if (typeof originalUrl === 'string') {
+      musicCacheService.cacheMusic(songId, originalUrl).catch(console.error)
+    }
 
-    return originalUrl
+    return playableUrl
   })
 
   // Setup Lyric Fetcher for lazy loading
@@ -852,6 +993,7 @@ registerAutoUpdateEvents()
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  registerServiceStreamProtocol()
   // 清理上次安装残留的安装包（仅限临时目录）
   try {
     await cleanupDownloadedInstallers()
@@ -894,11 +1036,28 @@ app.whenReady().then(async () => {
     console.log('Initializing plugins...')
     await pluginService.initializePlugins()
     console.log('Plugins initialized.')
+    markPluginSystemInitialized()
   } catch (error) {
     console.error('Failed to initialize plugins:', error)
   }
 
   createWindow()
+
+  // 启动后后台同步飞牛歌单。完成后通知渲染端刷新，不阻塞窗口显示。
+  void syncConfiguredFeiniuOnStartup()
+    .then((result) => {
+      if (result?.errors?.length) {
+        console.warn('Feiniu playlist sync completed with errors:', result.errors)
+      }
+      if (result?.imported?.length) {
+        for (const window of BrowserWindow.getAllWindows()) {
+          window.webContents.send('service-plugin-playlists-synced', result)
+        }
+      }
+    })
+    .catch((error) => {
+      console.warn('Failed to sync Feiniu playlists:', error)
+    })
 
   // 系统音频采集 - 媒体权限授权流程
   // 渲染端必须先调用 system-audio:prepare-capture 拿一次性令牌，否则 PermissionRequest 会被拒
@@ -912,9 +1071,17 @@ app.whenReady().then(async () => {
     }
     return true
   })
-  mainSession.setPermissionRequestHandler((webContents, permission, callback) => {
+  mainSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
     if (permission === 'media') {
       if (!webContents || !isMainWindowWebContents(webContents)) {
+        callback(false)
+        return
+      }
+      const grant = getMediaCaptureGrant(webContents.id)
+      if (
+        !grant ||
+        !mediaPermissionRequestMatchesGrant(grant, details as Electron.MediaAccessPermissionRequest)
+      ) {
         callback(false)
         return
       }
@@ -934,6 +1101,37 @@ app.whenReady().then(async () => {
         details.requestHeaders['Referer'] = baseUrl
         details.requestHeaders['referer'] = baseUrl
       }
+
+      // 飞牛封面等静态资源需要登录态。仅在配置的飞牛同源地址上注入 Cookie，
+      // 避免把令牌带到其他网站。
+      const feiniuPluginId = pluginService.getPluginIdByServiceRole('feiniu')
+      if (feiniuPluginId && details.url.includes('/music/api/v1/')) {
+        const config = pluginService.getConfig(feiniuPluginId)
+        const rawHost = String(config?.host || '').trim()
+        if (rawHost && config?.token) {
+          try {
+            const target = new URL(details.url)
+            const configured = new URL(
+              /^https?:\/\//i.test(rawHost)
+                ? rawHost
+                : `${config.useHttps === true ? 'https' : 'http'}://${rawHost}:${Number(config.port) > 0 ? Number(config.port) : config.useHttps === true ? 443 : 80}`
+            )
+            if (target.origin === configured.origin) {
+              const cookie = `music-token=${String(config.token)}`
+              details.requestHeaders.Cookie = cookie
+              details.requestHeaders.cookie = cookie
+              if (config.accessCode) {
+                const accessCode = Buffer.from(String(config.accessCode), 'utf8').toString('base64')
+                details.requestHeaders['x-access-code'] = accessCode
+                details.requestHeaders['x-access-source'] = 'app'
+              }
+            }
+          } catch (error) {
+            console.warn('[feiniu] failed to attach cover auth headers:', error)
+          }
+        }
+      }
+
       callback({ requestHeaders: details.requestHeaders })
     }
   )
@@ -1067,12 +1265,49 @@ ipcMain.handle('clipboard:read-text', async () => {
   }
 })
 
+// 权限管理 - 查询、申请与精确跳转系统设置
+ipcMain.handle('permissions:get-platform', async () => {
+  return getAppPlatform()
+})
+
+ipcMain.handle('permissions:get-media-status', async (_event, kind: MediaPermissionKind) => {
+  if (kind !== 'microphone' && kind !== 'system-audio') return 'unknown'
+  return getMediaPermissionStatus(kind)
+})
+
+ipcMain.handle('permissions:prepare-media-capture', async (event, kind: MediaPermissionKind) => {
+  if (!isMainWindowWebContents(event.sender)) return false
+  if (kind !== 'microphone' && kind !== 'system-audio') return false
+  authorizeMediaCaptureForWebContents(event.sender.id, kind)
+  return true
+})
+
+ipcMain.handle('permissions:request-microphone', async (event) => {
+  if (!isMainWindowWebContents(event.sender)) return false
+  if (process.platform !== 'darwin') return true
+
+  const status = getMediaPermissionStatus('microphone')
+  if (status === 'granted') return true
+  if (status === 'denied' || status === 'restricted') return false
+  return systemPreferences.askForMediaAccess('microphone')
+})
+
+ipcMain.handle('permissions:open-settings', async (event, target: PermissionGuideTarget) => {
+  if (!isMainWindowWebContents(event.sender)) return false
+  return openPermissionSettings(target)
+})
+
+ipcMain.handle('permissions:show-guide', async (event, target: PermissionGuideTarget) => {
+  if (!isMainWindowWebContents(event.sender)) return false
+  return showPermissionGuide(target)
+})
+
 // 系统音频采集 - 标记一次显式授权的采集会话
 ipcMain.handle('system-audio:prepare-capture', async (event) => {
   if (!isMainWindowWebContents(event.sender)) {
     return false
   }
-  authorizeMediaCaptureForWebContents(event.sender.id)
+  authorizeMediaCaptureForWebContents(event.sender.id, 'system-audio')
   return true
 })
 

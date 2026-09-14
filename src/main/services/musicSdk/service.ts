@@ -19,11 +19,15 @@ import musicSdk from '../../utils/musicSdk/index'
 import { musicCacheService } from '../musicCache'
 import { musicUrlCache } from '../musicUrlCache'
 import download from '../../utils/downloadSongs'
+import { createServiceStreamUrl } from '../plugin/serviceStream'
+import shazam from '../../utils/musicSdk/shazam'
 
 function main(source: string = 'wy') {
   if (source === 'all') return aggregateMain()
   const Api = musicSdk[source]
-  const checkDownloadableUrl = async (url: string): Promise<{ ok: boolean; size: number; reason?: string }> => {
+  const checkDownloadableUrl = async (
+    url: string
+  ): Promise<{ ok: boolean; size: number; reason?: string }> => {
     if (!url || typeof url !== 'string' || url.includes('error')) {
       return { ok: false, size: 0, reason: '无有效下载链接' }
     }
@@ -56,7 +60,8 @@ function main(source: string = 'wy') {
         contentType.includes('octet-stream') ||
         contentType.includes('application/x-mpegurl')
       if (bytes <= 0) return { ok: false, size: 0, reason: '下载响应为空' }
-      if (!looksLikeAudio) return { ok: false, size: contentLength || bytes, reason: '下载响应不是音频文件' }
+      if (!looksLikeAudio)
+        return { ok: false, size: contentLength || bytes, reason: '下载响应不是音频文件' }
       return { ok: true, size: contentLength || bytes }
     } catch (e: any) {
       return { ok: false, size: 0, reason: e?.message || '下载探测失败' }
@@ -77,6 +82,32 @@ function main(source: string = 'wy') {
       return await Api.radio.getPrograms({ radioId, page, limit, asc, radio })
     },
 
+    async getPodcastRecommendations({ limit = 20 } = {}) {
+      if (!Api.radio?.getRecommendations) {
+        return { list: [], radios: [], sections: [], total: 0, page: 1, limit, source } as any
+      }
+      return await Api.radio.getRecommendations({ limit })
+    },
+
+    async getPodcastCategories() {
+      if (!Api.radio?.getCategories) return []
+      return await Api.radio.getCategories()
+    },
+
+    async getPodcastCategoryPrograms({
+      categoryId,
+      page = 1,
+      limit = 20
+    }: {
+      categoryId: string
+      page?: number
+      limit?: number
+    }) {
+      if (!Api.radio?.getCategoryPrograms)
+        return { list: [], radios: [], total: 0, page, limit, source }
+      return await Api.radio.getCategoryPrograms({ categoryId, page, limit })
+    },
+
     async tipSearch({ keyword }: { keyword: string }) {
       if (!Api.tipSearch?.search) {
         // 如果音乐源没有实现tipSearch方法，返回空结果
@@ -91,13 +122,14 @@ function main(source: string = 'wy') {
         if (!pluginId || !usePlugin) return { error: '请配置音源来播放歌曲' }
 
         const currentSource = songInfo.source || source
+        const isServicePlugin = pluginService.getServiceRole(pluginId) === 'feiniu'
         // 生成歌曲唯一标识：source_songmid(or hash)_quality
         // songmid 是歌曲在对应源的稳定 ID，比 name+singer 更可靠
         const songMid = songInfo.songmid || songInfo.hash || `${songInfo.name}_${songInfo.singer}`
         const songId = `${currentSource}_${songMid}_${quality}`
 
         // 先检查 URL 字符串缓存（SQLite 持久化，避免重复 SDK 请求）
-        if (isCache !== false) {
+        if (isCache !== false && !isServicePlugin) {
           const cachedUrlStr = musicUrlCache.getUrl(songId)
           if (cachedUrlStr) {
             console.log('URL 缓存命中:', songId)
@@ -106,7 +138,7 @@ function main(source: string = 'wy') {
         }
 
         // 再检查文件级缓存（完整音频文件已下载）
-        if (isCache !== false) {
+        if (isCache !== false && !isServicePlugin) {
           const cachedUrl = await musicCacheService.getCachedMusicUrl(songId)
           if (cachedUrl) {
             return cachedUrl
@@ -117,16 +149,22 @@ function main(source: string = 'wy') {
         const originalUrl =
           source === 'git'
             ? await Api.getMusicUrl(songInfo, quality)
-            : await usePlugin.getMusicUrl(currentSource, songInfo, quality)
-        // 按需异步缓存，不阻塞返回
-        if (isCache !== false) {
+            : await usePlugin.getMusicUrl(
+                currentSource,
+                songInfo,
+                quality,
+                pluginService.getConfig(pluginId)
+              )
+        const playableUrl = createServiceStreamUrl(originalUrl) || originalUrl
+        // 按需异步缓存，不阻塞返回；取流代理地址本身是短期的，不能持久化。
+        if (isCache !== false && typeof originalUrl === 'string') {
           musicUrlCache.saveUrl(songId, originalUrl)
           musicCacheService.cacheMusic(songId, originalUrl).catch((error) => {
             console.warn('缓存歌曲失败:', error)
           })
         }
 
-        return originalUrl
+        return playableUrl
       } catch (e: any) {
         return {
           error: '获取歌曲失败 ' + e.error || e
@@ -135,7 +173,12 @@ function main(source: string = 'wy') {
     },
 
     async checkDownloadable({ pluginId, songInfo, quality, isCache }: GetMusicUrlArg) {
-      const urlData = await this.getMusicUrl({ pluginId, songInfo, quality, isCache: isCache ?? false })
+      const urlData = await this.getMusicUrl({
+        pluginId,
+        songInfo,
+        quality,
+        isCache: isCache ?? false
+      })
       if (typeof urlData === 'object') {
         return { ok: false, size: 0, reason: urlData.error || '无法获取下载链接' }
       }
@@ -367,10 +410,37 @@ function main(source: string = 'wy') {
       return await Api.comment.getComment(songInfo, page, limit)
     },
     // 听歌识曲
-    async recognize({ fp, duration }: { fp: string; duration: number }) {
-      if (source === 'wy' && Api.recognize) {
-        return await Api.recognize.recognize(fp, duration)
+    async recognize({
+      fp,
+      duration,
+      shazamSignature
+    }: {
+      fp?: string
+      duration: number
+      shazamSignature?: { uri: string; sampleMs: number }
+    }) {
+      if (source !== 'wy' || !Api.recognize) return []
+
+      // 与安卓版一致：先请求 Shazam，只有签名生成或请求未命中时才回退网易云 WASM。
+      if (shazamSignature?.uri) {
+        try {
+          const match = await shazam.recognizeSignature(
+            shazamSignature.uri,
+            shazamSignature.sampleMs
+          )
+          if (match) {
+            const search = await Api.musicSearch.search(
+              `${match.title} ${match.artist}`.trim(),
+              1,
+              10
+            )
+            return (search?.list || []).map((song) => ({ ...song, startTime: match.startTime }))
+          }
+        } catch (error) {
+          console.warn('[识曲] Shazam 请求失败，回退网易云指纹:', error)
+        }
       }
+      if (fp) return await Api.recognize.recognize(fp, duration)
       return []
     },
     // 获取专辑列表
@@ -392,9 +462,40 @@ function aggregateMain() {
     async searchRadio({ keyword, page = 1, limit = 20 }: SearchArg): Promise<any> {
       return await Agg.searchRadio(keyword, page, limit)
     },
-    async getRadioPrograms({ radioId, page = 1, limit = 30, asc = false, radio }: RadioProgramArg): Promise<any> {
+    async getRadioPrograms({
+      radioId,
+      page = 1,
+      limit = 30,
+      asc = false,
+      radio
+    }: RadioProgramArg): Promise<any> {
       const source = (radio as any)?.source || 'wy'
       return await Agg.getRadioPrograms({ radioId, source, page, limit, asc, radio })
+    },
+    async getPodcastRecommendations({ limit = 20 } = {}): Promise<any> {
+      const wy = (musicSdk as any).wy
+      if (!wy?.radio?.getRecommendations) {
+        return { list: [], radios: [], sections: [], total: 0, page: 1, limit, source: 'wy' }
+      }
+      return await wy.radio.getRecommendations({ limit })
+    },
+    async getPodcastCategories(): Promise<any> {
+      const wy = (musicSdk as any).wy
+      return wy?.radio?.getCategories ? await wy.radio.getCategories() : []
+    },
+    async getPodcastCategoryPrograms({
+      categoryId,
+      page = 1,
+      limit = 20
+    }: {
+      categoryId: string
+      page?: number
+      limit?: number
+    }): Promise<any> {
+      const wy = (musicSdk as any).wy
+      if (!wy?.radio?.getCategoryPrograms)
+        return { list: [], radios: [], total: 0, page, limit, source: 'wy' }
+      return await wy.radio.getCategoryPrograms({ categoryId, page, limit })
     },
     async tipSearch(_: { keyword: string }) {
       return (await Agg.tipSearch(_.keyword)) as Promise<TipSearchResult>

@@ -9,7 +9,7 @@ import { coverCacheService } from '../services/CoverCache'
 import { genId, genCoverKey, genCoverKeyWithMtime, normPath } from '../utils/fileUtils'
 import { readTags } from '../utils/tagUtils'
 import { is } from '@electron-toolkit/utils'
-import wy from '../utils/musicSdk/wy/recognize'
+import musicSdkService from '../services/musicSdk/service'
 import getLyric from '../utils/musicSdk/wy/lyric'
 import { httpFetch } from '../utils/request'
 
@@ -107,19 +107,35 @@ function extForFormat(fmt: string): string {
   }
 }
 
-async function walkDir(dir: string, results: string[]) {
+type InaccessibleDirectory = {
+  path: string
+  code?: string
+  message: string
+}
+
+async function walkDir(
+  dir: string,
+  results: string[],
+  inaccessibleDirs: InaccessibleDirectory[] = []
+) {
   try {
     const items = await fsp.readdir(dir, { withFileTypes: true })
     for (const item of items) {
       const full = path.join(dir, item.name)
       if (item.isDirectory()) {
-        await walkDir(full, results)
+        await walkDir(full, results, inaccessibleDirs)
       } else {
         const ext = path.extname(item.name).toLowerCase()
         if (AUDIO_EXTS.has(ext)) results.push(full)
       }
     }
-  } catch {}
+  } catch (error: any) {
+    inaccessibleDirs.push({
+      path: dir,
+      code: error?.code,
+      message: error?.message || '目录无法读取'
+    })
+  }
 }
 
 ipcMain.handle('local-music:select-dirs', async () => {
@@ -136,7 +152,7 @@ ipcMain.handle('dialog:openFile', async (_e, options) => {
 
 ipcMain.handle('local-music:scan', async (e, dirs: string[]) => {
   if (!Array.isArray(dirs) || dirs.length === 0) {
-    return ''
+    return { ok: true, inaccessibleDirs: [] }
   }
 
   const sender = e.sender
@@ -145,17 +161,31 @@ ipcMain.handle('local-music:scan', async (e, dirs: string[]) => {
   await new Promise((r) => setImmediate(r))
 
   const existsDirs: string[] = []
+  const inaccessibleDirs: InaccessibleDirectory[] = []
   for (const d of dirs) {
     try {
       if (fs.existsSync(d)) existsDirs.push(d)
-    } catch {}
+      else {
+        inaccessibleDirs.push({
+          path: d,
+          code: 'ENOENT',
+          message: '目录不存在或已被移动'
+        })
+      }
+    } catch (error: any) {
+      inaccessibleDirs.push({
+        path: d,
+        code: error?.code,
+        message: error?.message || '目录无法读取'
+      })
+    }
     await new Promise((r) => setImmediate(r))
   }
 
   const files: string[] = []
   try {
     for (const d of existsDirs) {
-      await walkDir(d, files)
+      await walkDir(d, files, inaccessibleDirs)
       await new Promise((r) => setImmediate(r))
     }
 
@@ -304,19 +334,25 @@ ipcMain.handle('local-music:scan', async (e, dirs: string[]) => {
 
     await localMusicIndexService.setDirs(existsDirs)
     await new Promise((r) => setImmediate(r))
-    await localMusicIndexService.pruneByScan(existsDirs, files)
-    await new Promise((r) => setImmediate(r))
+    if (inaccessibleDirs.length === 0) {
+      await localMusicIndexService.pruneByScan(existsDirs, files)
+      await new Promise((r) => setImmediate(r))
+    }
 
     // Renderer ignores this handler's return value and reacts to
     // scan-finished instead. Avoid serializing the whole library twice.
     const allSongs = localMusicIndexService.getAllSongs()
     sender.send('local-music:scan-finished', allSongs)
 
-    return ''
+    return { ok: true, inaccessibleDirs }
   } catch (err) {
     console.error('[local-music:scan] failed', err)
     sender.send('local-music:scan-finished', [])
-    return ''
+    return {
+      ok: false,
+      inaccessibleDirs,
+      message: (err as any)?.message || '扫描失败'
+    }
   }
 })
 
@@ -603,13 +639,13 @@ ipcMain.handle('local-music:batch-match', async (e, songmids: string[]) => {
 
   const pendingTasks = new Map<string, { resolve: Function; song: any }>()
 
-  const onResult = async (_e, { id, fp, duration }: any) => {
+  const onResult = async (_e, { id, fp, shazamSignature, duration }: any) => {
     const task = pendingTasks.get(id)
     if (!task) return
     pendingTasks.delete(id)
 
     try {
-      const results = await wy.recognize(fp, duration)
+      const results = await musicSdkService('wy').recognize({ fp, duration, shazamSignature })
       if (results && results.length > 0) {
         const best = results[0]
 

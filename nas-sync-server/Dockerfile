@@ -7,7 +7,8 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json yarn.lock ./
-RUN yarn install --production --frozen-lockfile
+RUN yarn install --production --frozen-lockfile --ignore-scripts \
+  && npm rebuild better-sqlite3
 
 COPY nas-sync-server/package.json ./package.json
 COPY nas-sync-server/src ./src

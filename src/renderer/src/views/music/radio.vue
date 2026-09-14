@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, toRaw, watch } from 'vue'
+import { ref, computed, toRaw, watch, onMounted, onUnmounted } from 'vue'
+import { favoritePodcast, listPodcastFavorites, unfavoritePodcast } from '@renderer/api/nasSync'
 import { useRoute } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
 import SongVirtualList from '@renderer/components/Music/SongVirtualList.vue'
@@ -42,6 +43,11 @@ const hasMore = ref(true)
 const sortAsc = ref(false)
 const currentSong = ref<MusicItem | null>(null)
 const isPlaying = ref(false)
+const favoriteLoading = ref(false)
+const favoriteKeys = ref(new Set<string>())
+
+const podcastFavoriteKey = (podcastSource: string, id: string) => `${podcastSource || 'wy'}:${id}`
+const isFavorite = computed(() => favoriteKeys.value.has(podcastFavoriteKey(source.value, radioId.value)))
 
 const radioPayload = computed(() => ({
   id: radioId.value,
@@ -55,6 +61,40 @@ const radioPayload = computed(() => ({
 }))
 
 const sortLabel = computed(() => (sortAsc.value ? '发布时间正序' : '发布时间倒序'))
+
+const refreshFavoriteState = async () => {
+  const favorites = await listPodcastFavorites()
+  favoriteKeys.value = new Set(favorites.map((item) => podcastFavoriteKey(item.source || 'wy', item.radioId)))
+}
+
+const handleFavoriteUpdate = () => {
+  void refreshFavoriteState()
+}
+
+const toggleFavorite = async () => {
+  if (!radioId.value || favoriteLoading.value) return
+  const wasFavorite = isFavorite.value
+  favoriteLoading.value = true
+  try {
+    const result = wasFavorite
+      ? await unfavoritePodcast(source.value, radioId.value)
+      : await favoritePodcast({
+          radioId: radioId.value,
+          source: source.value as any,
+          title: title.value,
+          description: desc.value,
+          coverUrl: cover.value,
+          author: author.value,
+          total: Number(totalText.value) || undefined,
+          playCount: playCount.value || undefined
+        })
+    await refreshFavoriteState()
+    if (result.syncError) MessagePlugin.warning(`${result.syncError.message}，已保留本地收藏`)
+    else MessagePlugin.success(wasFavorite ? '已取消收藏' : '已收藏电台')
+  } finally {
+    favoriteLoading.value = false
+  }
+}
 
 const fetchPrograms = async (reset = false) => {
   if (loading.value || !radioId.value) return
@@ -140,9 +180,21 @@ const handleScroll = (event: Event) => {
   }
 }
 
+onMounted(() => {
+  void refreshFavoriteState()
+  window.addEventListener('ceru-podcast-favorites-updated', handleFavoriteUpdate)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('ceru-podcast-favorites-updated', handleFavoriteUpdate)
+})
+
 watch(
   () => [radioId.value, source.value],
-  () => fetchPrograms(true),
+  () => {
+    void fetchPrograms(true)
+    void refreshFavoriteState()
+  },
   { immediate: true }
 )
 </script>
@@ -162,6 +214,9 @@ watch(
         </div>
         <div class="radio-actions">
           <button class="primary" :disabled="!programs.length" @click="playAll">播放全部</button>
+          <button class="secondary" :disabled="favoriteLoading" @click="toggleFavorite">
+            {{ isFavorite ? '取消收藏' : '收藏电台' }}
+          </button>
           <button class="secondary" @click="toggleSort">{{ sortLabel }}</button>
         </div>
       </div>

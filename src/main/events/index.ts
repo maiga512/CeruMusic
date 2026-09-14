@@ -9,6 +9,7 @@ import { type BrowserWindow, ipcMain } from 'electron'
 import lyricWindow from '../windows/lyric-window'
 import { initDlnaService } from './dlna'
 import { configManager } from '../services/ConfigManager'
+import initPodcastEvents from './podcast'
 
 export default function InitEventServices(mainWindow: BrowserWindow) {
   InitPluginService()
@@ -17,6 +18,7 @@ export default function InitEventServices(mainWindow: BrowserWindow) {
   initFontEvents()
   // initLocalMusicEvents()
   initDlnaService()
+  initPodcastEvents()
   basisEvent(mainWindow)
 }
 

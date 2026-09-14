@@ -256,6 +256,9 @@ CeruMuisc/
 
 ### 平台构建指令
 
+> 打包前请先阅读 [BUILDING.md](./BUILDING.md)。完成打包后必须运行
+> `yarn verify:package <应用路径>`，防止旧的 `dist` 构建产物被递归打入新安装包。
+
 - Windows
 
   ```bash

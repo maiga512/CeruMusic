@@ -31,6 +31,7 @@ import { pluginLog } from '../../../logger'
 //    避免长会话里偶发抖动累积导致永久禁用。
 const CONSTANTS = {
   INVOKE_TIMEOUT: 30_000,
+  PLAYLIST_INVOKE_TIMEOUT: 120_000,
   INIT_TIMEOUT: 8_000,
   CRASH_LIMIT: 5,
   /** crashCount 衰减窗口：worker 稳定运行 5 分钟后衰减一次。 */
@@ -243,9 +244,15 @@ class CeruMusicPluginHost {
   }
 
   // ---------- 音源类调用 ----------
-  async getMusicUrl(source: string, musicInfo: MusicInfo, quality: string): Promise<string> {
+  async getMusicUrl(
+    source: string,
+    musicInfo: MusicInfo,
+    quality: string,
+    serviceConfig?: Record<string, any>
+  ): Promise<any> {
     const songinfo = {
       ...musicInfo,
+      ...(serviceConfig ? { _serviceConfig: serviceConfig } : {}),
       id: musicInfo.songmid || (musicInfo as any).hash
     }
     return this._callPluginMethod('musicUrl', [source, songinfo, quality])
@@ -511,14 +518,7 @@ class CeruMusicPluginHost {
     // 广播事件
     if (msg.type === 'log') {
       // 包含 group / groupEnd / debug 等扩展级别，全部转发给 Logger
-      const level = msg.level as
-        | 'log'
-        | 'info'
-        | 'warn'
-        | 'error'
-        | 'debug'
-        | 'group'
-        | 'groupEnd'
+      const level = msg.level as 'log' | 'info' | 'warn' | 'error' | 'debug' | 'group' | 'groupEnd'
       const args = Array.isArray(msg.args) ? msg.args : []
       try {
         const fn = (this.logger as any)[level]
@@ -647,10 +647,12 @@ class CeruMusicPluginHost {
     const worker = this.worker
 
     return new Promise<any>((resolve, reject) => {
+      const timeoutMs =
+        method === 'getPlaylistSongs' ? CONSTANTS.PLAYLIST_INVOKE_TIMEOUT : CONSTANTS.INVOKE_TIMEOUT
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return
         this.pending.delete(id)
-        const errMsg = `Plugin ${method} timed out after ${CONSTANTS.INVOKE_TIMEOUT}ms`
+        const errMsg = `Plugin ${method} timed out after ${timeoutMs}ms`
         pluginLog.error(`${CONSTANTS.LOG_PREFIX} ${errMsg}`)
         // 仅当 worker 同时心跳丢失（真卡死）才强杀重启；
         // 单次 HTTP 慢不应等同 worker 崩溃，否则插件极易被无故禁用。
@@ -666,7 +668,7 @@ class CeruMusicPluginHost {
           )
         }
         reject(new PluginError(errMsg, method))
-      }, CONSTANTS.INVOKE_TIMEOUT)
+      }, timeoutMs)
 
       this.pending.set(id, {
         resolve: (data: any) => {

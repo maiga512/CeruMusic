@@ -113,16 +113,6 @@ const emitter = mitt<PlaylistEvents>()
 
 // 将事件总线挂载到全局
 ;(window as any).musicEmitter = emitter
-const qualityMap: Record<string, string> = {
-  '128k': '标准音质',
-  '192k': '高品音质',
-  '320k': '超高品质',
-  flac: '无损音质',
-  flac24bit: '超高解析',
-  hires: '高清臻音',
-  atmos: '全景环绕',
-  master: '超清母带'
-}
 /**
  * 获取歌曲真实播放URL
  * @param song 歌曲对象
@@ -137,8 +127,9 @@ export async function getSongRealUrl(song: SongList): Promise<string> {
       if (typeof url === 'string') return url
       throw new Error('本地歌曲URL获取失败')
     }
-    // 服务插件歌曲（如 navidrome）：直接使用 url 字段
-    if ((song as any).url && typeof (song as any).url === 'string') {
+    // 服务插件歌曲要重新走主进程取流，确保每次请求都带认证信息；普通直链继续兼容。
+    const servicePluginId = (song as any)._servicePluginId
+    if ((song as any).url && typeof (song as any).url === 'string' && !servicePluginId) {
       return (song as any).url
     }
     const LocalUserDetail = LocalUserDetailStore()
@@ -156,13 +147,13 @@ export async function getSongRealUrl(song: SongList): Promise<string> {
       .sort(compareQuality)
     const qualitiesToTry = [firstQuality, ...fallbackQualities]
 
-    console.log(`使用音质: ${firstQuality} - ${qualityMap[firstQuality]}`)
-    if (!LocalUserDetail.userSource.pluginId) throw new Error('插件都不配就想播放，想的倒挺美呢')
+    const activePluginId = servicePluginId || LocalUserDetail.userSource.pluginId
+    if (!activePluginId) throw new Error('插件都不配就想播放，想的倒挺美呢')
 
     let lastError: any = null
     for (const qualityToTry of qualitiesToTry) {
       const urlData = await window.api.music.requestSdk('getMusicUrl', {
-        pluginId: LocalUserDetail.userSource.pluginId,
+        pluginId: activePluginId,
         source: song.source,
         songInfo: song as any,
         quality: qualityToTry,
@@ -215,7 +206,8 @@ export async function addToPlaylistAndPlay(
     return
   }
   try {
-    const getSongIdentity = (item: SongList) => item.songmid || item.hash || `${item.name}_${item.singer}`
+    const getSongIdentity = (item: SongList) =>
+      item.songmid || item.hash || `${item.name}_${item.singer}`
     const currentId = localUserStore.userInfo?.lastPlaySongId
     const currentSource = localUserStore.userInfo?.lastPlaySongSource
     const currentIndex =

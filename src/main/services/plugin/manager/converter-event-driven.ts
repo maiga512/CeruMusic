@@ -222,6 +222,13 @@ function initializePlugin() {
             return str;
           }
         },
+        sha256: (str) => {
+          try {
+            return utils.crypto ? utils.crypto.sha256(str) : str;
+          } catch (e) {
+            return str;
+          }
+        },
         randomBytes: (size) => {
           try {
             return utils.crypto ? utils.crypto.randomBytes(size) : Buffer.alloc(size);

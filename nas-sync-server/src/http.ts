@@ -434,6 +434,21 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
       return database.getSyncEvents(session.user.id, Number.isFinite(sinceRevision) ? sinceRevision : 0);
     },
   },
+  '/sync/wait': {
+    GET: ({auth, url}) => {
+      const session = requireAuth(auth);
+      const sinceRevision = Number(url.searchParams.get('sinceRevision') || 0);
+      const timeoutMs = Math.min(
+        25_000,
+        Math.max(0, Number(url.searchParams.get('timeout') || 20_000)),
+      );
+      return database.waitForSyncEvents(
+        session.user.id,
+        Number.isFinite(sinceRevision) ? sinceRevision : 0,
+        Number.isFinite(timeoutMs) ? timeoutMs : 20_000,
+      );
+    },
+  },
   '/user-songlist': {
     GET: ({auth}) => database.listPlaylists(requireAuth(auth).user.id),
     POST: ({auth, body}) => database.createPlaylist(requireAuth(auth).user.id, body),
@@ -484,6 +499,12 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
   '/favorites': {
     GET: ({auth, url}) => ({items: database.listFavorites(requireAuth(auth).user.id, url.searchParams.get('entityType') || undefined)}),
     POST: ({auth, body}) => database.upsertFavorite(requireAuth(auth).user.id, body),
+    DELETE: ({auth, body, url}) =>
+      database.deleteFavorite(requireAuth(auth).user.id, {
+        entityType: getString(body.entityType || url.searchParams.get('entityType')),
+        entityId: getString(body.entityId || url.searchParams.get('entityId')),
+        playlistId: getString(body.playlistId || url.searchParams.get('playlistId')),
+      }),
   },
 });
 

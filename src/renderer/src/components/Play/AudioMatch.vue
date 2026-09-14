@@ -14,7 +14,7 @@ const isProcessingFile = ref(false)
 
 let audioCtx: AudioContext | null = null
 let recorderNode: AudioWorkletNode | null = null
-let audioNode: MediaElementAudioSourceNode | null = null
+let audioNode: MediaStreamAudioSourceNode | null = null
 let micStream: MediaStream | null = null
 
 function reset() {
@@ -25,15 +25,15 @@ function reset() {
 async function init() {
   if (audioCtx) return true
   audioCtx = new AudioContext({ sampleRate: 8000 })
-  if (audioCtx.state === 'suspended') return false
-  // 注意：当前 audio 元素 id 就是 "globaAudio"（拼写存在历史遗留，未修正）
-  const audioEl = document.getElementById('globaAudio') as HTMLAudioElement | null
-  if (!audioEl) return false
-  audioNode = audioCtx.createMediaElementSource(audioEl)
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume()
+    if (audioCtx.state === 'suspended') return false
+  }
+  if (!micStream) return false
+  audioNode = audioCtx.createMediaStreamSource(micStream)
   await audioCtx.audioWorklet.addModule('/rec.js')
   recorderNode = new AudioWorkletNode(audioCtx, 'timed-recorder')
   audioNode.connect(recorderNode)
-  audioNode.connect(audioCtx.destination)
   recorderNode.port.onmessage = (event: MessageEvent<any>) => {
     const data = event.data
     if (!data) return
@@ -57,26 +57,41 @@ async function stopMicCapture() {
     await audioCtx.close()
     audioCtx = null
   }
+  recorderNode?.disconnect()
+  audioNode?.disconnect()
+  recorderNode = null
+  audioNode = null
 }
 
 async function start() {
   results.value = []
   showResults.value = false
 
-  // 先请求麦克风权限（macOS 上需要）
+  // 只在用户点击麦克风后申请麦克风权限。
+  const microphoneGranted = await window.api.permissions.requestMicrophone()
+  if (!microphoneGranted) {
+    micPermissionDenied.value = true
+    await window.api.permissions.showGuide('microphone')
+    return
+  }
+
+  const capturePrepared = await window.api.permissions.prepareMediaCapture('microphone')
+  if (!capturePrepared) {
+    MessagePlugin.error('麦克风采集请求未获授权')
+    return
+  }
+
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true })
     micPermissionDenied.value = false
   } catch {
     micPermissionDenied.value = true
-    MessagePlugin.warning({
-      content: '麦克风权限被拒绝，请前往系统设置 > 隐私与安全性 > 麦克风 开启权限',
-      duration: 5000
-    })
+    await window.api.permissions.showGuide('microphone')
     return
   }
 
   if (!(await init())) {
+    await stopMicCapture()
     MessagePlugin.warning('音频上下文未能初始化')
     return
   }

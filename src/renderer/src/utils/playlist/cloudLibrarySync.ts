@@ -7,6 +7,7 @@ import {
 } from '@renderer/api/cloudSongList'
 import { canUseNasSync, nasCloudSongListAPI } from '@renderer/api/nasSync'
 import { mapCloudSongToLocal, mapSongsToCloud } from '@renderer/utils/playlist/cloudList'
+import { isBridgedPlaylist } from '@renderer/utils/playlist/bridgedPlaylist'
 import { getPersistentMeta } from '@renderer/utils/playlist/meta'
 import type { SongList, Songs } from '@common/types/songList'
 
@@ -64,7 +65,7 @@ const createCloudPlaylist = async (playlist: SongList, songs: readonly Songs[] =
     name: playlist.name,
     describe: playlist.description || '',
     cover: playlist.coverImgUrl && playlist.coverImgUrl !== 'default-cover' ? playlist.coverImgUrl : undefined,
-    songlist: mapSongsToCloud(songs)
+    songlist: mapSongsToCloud(songs, true)
   })
 
   return {
@@ -143,6 +144,7 @@ export const ensureLocalFavoritesPlaylist = async () => {
 
 export const ensureCloudPlaylistForLocal = async (playlist: SongList) => {
   if (!(await canUseCloudLibrary())) return null
+  if (isBridgedPlaylist(playlist)) return null
   if (playlist.meta?.isCloudOnly) return playlist.meta?.cloudId || playlist.id
 
   try {
@@ -271,6 +273,7 @@ export const syncPlaylistInfoToCloud = async (playlist: SongList) => {
 
 export const syncDeletePlaylistFromCloud = async (playlist: SongList) => {
   if (!(await canUseCloudLibrary())) return null
+  if (isBridgedPlaylist(playlist)) return null
   const cloudId = playlist.meta?.cloudId || (playlist.meta?.isCloudOnly ? playlist.id : '')
   if (!cloudId) return null
   const syncAPI = await getSongListSyncAPI()

@@ -355,8 +355,11 @@
             </div>
 
             <div class="config-test">
+              <div v-if="configServiceRole === 'feiniu'" class="nas-sync-status-hint">
+                服务器主机只填域名或 IP，不要带 http://、https:// 或路径；端口和 HTTPS 分开填写。反向代理使用 443 等端口时，把实际端口填到“服务器端口”。
+              </div>
               <div v-if="isNasSyncConfig" class="nas-sync-status-hint">
-                这是你自建部署的同步服务器地址，可部署在 NAS、软路由、小服务器或 Docker 面板上，用于歌单备份和多端同步，不是公共云地址。
+                服务器主机只填域名或 IP，不要带 http://、https:// 或路径；协议由 HTTPS 开关控制。可部署在 NAS、软路由、小服务器或 Docker 面板上。
               </div>
               <div
                 v-if="isNasSyncConfig"
@@ -419,6 +422,10 @@ import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import { LocalUserDetailStore } from '@renderer/store/LocalUserDetail'
 import ImportPlaylist from '@renderer/components/ServicePlugin/ImportPlaylist.vue'
 import { runNasSyncNow } from '@renderer/services/nasSyncPoller'
+import {
+  buildNasSyncServerUrl,
+  parseNasSyncServerUrl
+} from '@renderer/api/nasSync'
 import { startNasSyncPoller, stopNasSyncPoller } from '@renderer/services/nasSyncPoller'
 
 interface PluginSource {
@@ -923,6 +930,16 @@ async function openConfigDialog(plugin: Plugin) {
       for (const key of NAS_SYNC_PERSISTED_KEYS) {
         if (savedConfig[key] !== undefined) values[key] = savedConfig[key]
       }
+      if (!String(values.host || '').trim() && savedConfig.serverUrl) {
+        const parts = parseNasSyncServerUrl(savedConfig.serverUrl)
+        if (parts) {
+          values.host = parts.host
+          values.port = parts.port
+          values.useHttps = parts.useHttps
+        }
+      }
+      if (!Number(values.port)) values.port = 31231
+      values.useHttps = values.useHttps === true
       if (!values.syncMode) values.syncMode = 'auto'
     }
     configValues.value = values
@@ -957,12 +974,16 @@ function buildPluginConfigForSave() {
       configValues.value[key] = savedConfigSnapshot.value[key]
     }
   }
+
+  const serverUrl = buildNasSyncServerUrl(plainConfig as any)
+  plainConfig.serverUrl = serverUrl
+  configValues.value.serverUrl = serverUrl
   return plainConfig
 }
 
 async function ensureNasSyncSession(reason = 'manual', options: { sync?: boolean } = {}) {
-  if (!configValues.value.serverUrl?.trim()) {
-    throw new Error('请先填写同步服务器地址')
+  if (!String(configValues.value.host || '').trim()) {
+    throw new Error('请先填写同步服务器主机')
   }
 
   const currentPairCode =
@@ -973,7 +994,8 @@ async function ensureNasSyncSession(reason = 'manual', options: { sync?: boolean
   }
   configValues.value.pairCode = currentPairCode
 
-  const baseUrl = String(configValues.value.serverUrl || '').trim().replace(/\/+$/, '')
+  const plainConfigForUrl = buildPluginConfigForSave()
+  const baseUrl = String(plainConfigForUrl.serverUrl || '').trim().replace(/\/+$/, '')
   const response = await fetch(`${baseUrl}/auth/pair`, {
     method: 'POST',
     headers: {
@@ -1016,7 +1038,7 @@ async function probeNasSyncConnection(options: { silent?: boolean } = {}) {
   const baseUrl = String(plainConfig.serverUrl || '').trim().replace(/\/+$/, '')
   if (!baseUrl) {
     configValues.value.status = 'disconnected'
-    configTestResult.value = { success: false, message: '请先填写同步服务器地址' }
+    configTestResult.value = { success: false, message: '请先填写同步服务器主机和端口' }
     return configTestResult.value
   }
 
@@ -1149,11 +1171,26 @@ async function testPluginConnection() {
     savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
 
     const result = await window.api.plugins.testConnection(configPluginId.value)
-    configTestResult.value = result
+    let message = result?.message || (result?.success ? '连接成功' : '连接失败')
+    const autoImport = result?.autoImport
+    if (result?.success && Array.isArray(autoImport?.imported) && autoImport.imported.length > 0) {
+      const importedCount = autoImport.imported.length
+      const songCount = autoImport.imported.reduce(
+        (sum: number, item: any) => sum + Number(item.total || 0),
+        0
+      )
+      message += `，已同步 ${importedCount} 个歌单、${songCount} 首歌曲到“我的歌单”`
+    }
+    if (Array.isArray(autoImport?.errors) && autoImport.errors.length > 0) {
+      message += `；${autoImport.errors.length} 个歌单同步失败`
+    }
+
+    configTestResult.value = { ...result, message }
     if (result?.success) {
-      MessagePlugin.success(result.message || '连接成功')
+      window.dispatchEvent(new Event('playlist-updated'))
+      MessagePlugin.success(message)
     } else {
-      MessagePlugin.error(result?.message || '连接失败')
+      MessagePlugin.error(message)
     }
   } catch (err: any) {
     configTestResult.value = { success: false, message: err.message }

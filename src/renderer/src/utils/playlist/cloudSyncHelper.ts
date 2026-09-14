@@ -4,6 +4,7 @@ import { getPreferredSongListAPI } from '@renderer/api/nasSync'
 import songListAPI from '@renderer/api/songList'
 import { getPersistentMeta } from '@renderer/utils/playlist/meta'
 import { mapSongsToCloud } from '@renderer/utils/playlist/cloudList'
+import { isBridgedPlaylist } from '@renderer/utils/playlist/bridgedPlaylist'
 import { isBase64, base64ToFile } from '@renderer/utils/file'
 
 export interface PlaylistInfo {
@@ -72,7 +73,7 @@ const createCloudPlaylistFromLocal = async (playlist: PlaylistInfo, songs: any[]
     name: playlist.name,
     describe: playlist.description,
     cover,
-    songlist: mapSongsToCloud(songs)
+    songlist: mapSongsToCloud(songs, true)
   })
   return res
 }
@@ -86,6 +87,11 @@ export async function handleUploadToCloudHelper(
   onSuccess?: () => void,
   options: CloudSyncHelperOptions = {}
 ) {
+  if (isBridgedPlaylist(playlist, songs)) {
+    if (!options.silent) MessagePlugin.info('飞牛音乐由插件直接读取 NAS，不参与多端同步')
+    return playlist.meta
+  }
+
   const loadingMsg = options.silent ? null : MessagePlugin.loading('正在上传到云端...', 0)
   try {
     const cover = isBase64(playlist.cover)
@@ -131,6 +137,11 @@ export async function handleSyncToCloudHelper(
   onSuccess?: () => void,
   options: CloudSyncHelperOptions = {}
 ) {
+  if (isBridgedPlaylist(playlist, songs)) {
+    if (!options.silent) MessagePlugin.info('飞牛音乐由插件直接读取 NAS，不参与多端同步')
+    return playlist.meta
+  }
+
   const loadingMsg = options.silent ? null : MessagePlugin.loading('正在同步到云端...', 0)
   try {
     if (!playlist.meta?.cloudId) {
@@ -152,7 +163,7 @@ export async function handleSyncToCloudHelper(
         name: playlist.name,
         describe: playlist.description,
         cover: cover,
-        songlist: mapSongsToCloud(songs)
+        songlist: mapSongsToCloud(songs, true)
       })
     } catch (error) {
       if (!isMissingCloudPlaylistError(error)) throw error

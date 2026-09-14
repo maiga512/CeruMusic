@@ -10,8 +10,14 @@ files:
   - '!scripts/*'
   - '!assets/*'
   - '!docs/*'
+  - '!dist/**'
+  - '!dist-*/**'
+  - '!test-data/**'
+  - '!**/._*'
+  - '!**/*.map'
+  - '!**/*.tsbuildinfo'
   - '!electron.vite.config.{js,ts,mjs,cjs}'
-  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md,.idea,.kiro,.codebuddy}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md,BUILDING.md,.idea,.kiro,.codebuddy}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
@@ -72,9 +78,11 @@ mac:
         - x64
         - arm64
   extendInfo:
-    - NSDocumentsFolderUsageDescription: 需要访问文档文件夹来保存和打开您创建的文件。
-    - NSDownloadsFolderUsageDescription: 需要访问下载文件夹来管理您下载的歌曲。
-    - NSMicrophoneUsageDescription: 需要访问麦克风以支持录音相关功能。
+    NSDocumentsFolderUsageDescription: 需要访问文档文件夹来保存和打开您创建的文件。
+    NSDownloadsFolderUsageDescription: 需要访问下载文件夹来管理您下载的歌曲。
+    NSMicrophoneUsageDescription: 听歌识曲需要使用麦克风采集周围的声音。
+    NSAudioCaptureUsageDescription: 识别电脑正在播放的声音需要采集系统音频。
+    NSLocalNetworkUsageDescription: 需要访问局域网中的飞牛音乐服务和自建同步服务器。
   hardenedRuntime: true
   gatekeeperAssess: false
   entitlements: build/entitlements.mac.plist

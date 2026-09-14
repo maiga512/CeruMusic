@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
+import type {
+  AppPlatform,
+  MediaPermissionKind,
+  MediaPermissionStatus,
+  PermissionGuideTarget
+} from '../common/types/permissions'
 import type { HotkeyConfigPayload } from '@common/types/hotkeys'
 
 // Custom APIs for renderer
@@ -49,6 +55,24 @@ const api = {
       ipcRenderer.invoke('service-music-sdk-request', api, args),
     invoke: (channel: string, ...args: any[]) => ipcRenderer.invoke(channel, ...args)
   },
+  podcast: {
+    getLoginState: () => ipcRenderer.invoke('podcast:get-login-state'),
+    createQr: () => ipcRenderer.invoke('podcast:create-qr'),
+    checkQr: (key: string) => ipcRenderer.invoke('podcast:check-qr', key),
+    logout: () => ipcRenderer.invoke('podcast:logout'),
+    getCategoryPage: (payload: any) => ipcRenderer.invoke('podcast:get-category-page', payload),
+    getCategoryTotal: (payload: any) => ipcRenderer.invoke('podcast:get-category-total', payload),
+    getHomeChannel: (payload: any) => ipcRenderer.invoke('podcast:get-home-channel', payload),
+    search: (payload: any) => ipcRenderer.invoke('podcast:search', payload),
+    getPrograms: (payload: any) => ipcRenderer.invoke('podcast:get-programs', payload),
+    getRadioDetail: (radioId: string) => ipcRenderer.invoke('podcast:get-radio-detail', radioId),
+    getPlayUrl: (payload: any) => ipcRenderer.invoke('podcast:get-play-url', payload),
+    getProgramLyric: (song: any) => ipcRenderer.invoke('podcast:get-program-lyric', song),
+    getRecommendations: (limit = 30) => ipcRenderer.invoke('podcast:get-recommendations', limit),
+    getCategories: () => ipcRenderer.invoke('podcast:get-categories'),
+    getCategoryPrograms: (categoryId: string, page = 1, limit = 30) =>
+      ipcRenderer.invoke('podcast:get-category-programs', categoryId, page, limit)
+  },
   //音源插件
   plugins: {
     selectAndAddPlugin: (type: 'lx' | 'cr') =>
@@ -65,6 +89,11 @@ const api = {
     getPluginLog: (pluginId: string) => ipcRenderer.invoke('service-plugin-getPluginLog', pluginId),
     appendPluginLog: (pluginId: string, level: string, ...args: any[]) =>
       ipcRenderer.invoke('service-plugin-appendPluginLog', pluginId, level, ...args),
+    onPlaylistsSynced: (callback: (summary: any) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, summary: any) => callback(summary)
+      ipcRenderer.on('service-plugin-playlists-synced', handler)
+      return () => ipcRenderer.removeListener('service-plugin-playlists-synced', handler)
+    },
     // 服务插件相关
     getPluginType: (pluginId: string) =>
       ipcRenderer.invoke('service-plugin-getPluginType', pluginId),
@@ -454,6 +483,18 @@ const api = {
       return []
     }
   },
+  permissions: {
+    getPlatform: (): Promise<AppPlatform> => ipcRenderer.invoke('permissions:get-platform'),
+    getMediaStatus: (kind: MediaPermissionKind): Promise<MediaPermissionStatus> =>
+      ipcRenderer.invoke('permissions:get-media-status', kind),
+    prepareMediaCapture: (kind: MediaPermissionKind) =>
+      ipcRenderer.invoke('permissions:prepare-media-capture', kind),
+    requestMicrophone: (): Promise<boolean> => ipcRenderer.invoke('permissions:request-microphone'),
+    openSettings: (target: PermissionGuideTarget): Promise<boolean> =>
+      ipcRenderer.invoke('permissions:open-settings', target),
+    showGuide: (target: PermissionGuideTarget): Promise<boolean> =>
+      ipcRenderer.invoke('permissions:show-guide', target)
+  },
   // 歌曲分享
   share: {
     getPluginCodeAndMd5: (
@@ -524,20 +565,25 @@ const api = {
     setProgress: (progress: number, options?: { paused?: boolean }) =>
       ipcRenderer.send('app:set-progress', progress, options || null),
     getWindowState: () => ipcRenderer.invoke('app:get-window-state'),
-    onWindowStateChanged: (callback: (state: {
-      visible: boolean
-      focused: boolean
-      minimized: boolean
-      hidden: boolean
-      fullscreen: boolean
-    }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, state: {
+    onWindowStateChanged: (
+      callback: (state: {
         visible: boolean
         focused: boolean
         minimized: boolean
         hidden: boolean
         fullscreen: boolean
-      }) => callback(state)
+      }) => void
+    ) => {
+      const handler = (
+        _: Electron.IpcRendererEvent,
+        state: {
+          visible: boolean
+          focused: boolean
+          minimized: boolean
+          hidden: boolean
+          fullscreen: boolean
+        }
+      ) => callback(state)
       ipcRenderer.on('app:window-state-changed', handler)
       return () => ipcRenderer.removeListener('app:window-state-changed', handler)
     }

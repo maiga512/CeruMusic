@@ -2,27 +2,18 @@
 import { ref, onUnmounted } from 'vue'
 import { ControlAudioStore } from '@renderer/store/ControlAudio'
 import { MessagePlugin } from 'tdesign-vue-next'
-import {
-  MicrophoneIcon,
-  StopCircleIcon,
-  UploadIcon,
-  PlayCircleIcon,
-  SearchIcon,
-  RefreshIcon,
-  PlayIcon
-} from 'tdesign-icons-vue-next'
-import { LocalUserDetailStore } from '@renderer/store/LocalUserDetail'
-import { playSong } from '@renderer/utils/audio/globaPlayList'
+import { SoundIcon } from 'tdesign-icons-vue-next'
 import { searchValue } from '@renderer/store/search'
 import { useRouter } from 'vue-router'
+import { generateShazamSignature } from '@renderer/utils/shazam'
 
 const audioStore = ControlAudioStore()
-const localUserStore = LocalUserDetailStore()
 const searchStore = searchValue()
 const router = useRouter()
 
-const MAX_DURATION = 15
-const SLICE_DURATION = 3000 // 3s
+const MAX_DURATION = 20
+const MIN_MATCH_DURATION = 5
+const SLICE_DURATION = 5000 // 与安卓版一致：每 5 秒尝试一次识别
 
 const running = ref(false)
 const status = ref('') // 'recording' | 'processing' | 'uploading' | 'success' | 'failed'
@@ -34,6 +25,7 @@ let recorder: MediaRecorder | null = null
 let chunks: Blob[] = []
 let stream: MediaStream | null = null
 let timer: any = null
+let recognitionInFlight = false
 
 function loadScript(src: string) {
   return new Promise<void>((resolve, reject) => {
@@ -62,11 +54,11 @@ async function ensureAFP() {
   }
 }
 
-async function resampleTo8kMono(audioBuffer: AudioBuffer): Promise<Float32Array> {
+async function resampleToMono(audioBuffer: AudioBuffer, sampleRate: number): Promise<Float32Array> {
   const ctx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
     1,
-    Math.floor(audioBuffer.duration * 8000),
-    8000
+    Math.floor(audioBuffer.duration * sampleRate),
+    sampleRate
   )
 
   const source = ctx.createBufferSource()
@@ -78,6 +70,10 @@ async function resampleTo8kMono(audioBuffer: AudioBuffer): Promise<Float32Array>
   return renderedBuffer.getChannelData(0)
 }
 
+async function resampleTo8kMono(audioBuffer: AudioBuffer): Promise<Float32Array> {
+  return resampleToMono(audioBuffer, 8000)
+}
+
 async function start() {
   if (running.value) return
 
@@ -85,16 +81,19 @@ async function start() {
     status.value = 'initializing'
     await ensureAFP()
 
-    // Pause music if playing
-    if (audioStore.Audio.isPlay) {
-      wasPlaying.value = true
-      await audioStore.stop()
-    } else {
-      wasPlaying.value = false
+    const platform = await window.api.permissions.getPlatform()
+    const initialPermission = await window.api.permissions.getMediaStatus('system-audio')
+    if (
+      platform === 'darwin' &&
+      (initialPermission === 'denied' || initialPermission === 'restricted')
+    ) {
+      await window.api.permissions.showGuide('screen-recording')
+      reset()
+      return
     }
 
-    // 必须先调用 prepareCapture 拿一次性媒体采集授权（10s 过期）
-    const capturePrepared = await window.api.systemAudio.prepareCapture()
+    // 只授权这一次系统音频采集，不会同时放开麦克风权限。
+    const capturePrepared = await window.api.permissions.prepareMediaCapture('system-audio')
     if (!capturePrepared) {
       MessagePlugin.error('当前采集请求未获授权，请重新点击开始识别')
       reset()
@@ -104,7 +103,17 @@ async function start() {
     // Get system audio stream
     const sourceId = await window.api.systemAudio.getDefaultScreenSourceId()
     if (!sourceId) {
-      MessagePlugin.error('无法获取系统音频采集源，请重新点击开始识别')
+      const currentPermission = await window.api.permissions.getMediaStatus('system-audio')
+      if (
+        platform === 'darwin' &&
+        (currentPermission === 'denied' ||
+          currentPermission === 'restricted' ||
+          currentPermission === 'not-determined')
+      ) {
+        await window.api.permissions.showGuide('screen-recording')
+      } else {
+        MessagePlugin.error('无法获取系统音频采集源，请重新点击开始识别')
+      }
       reset()
       return
     }
@@ -130,6 +139,29 @@ async function start() {
         }
       } as any
     })
+
+    if (platform === 'darwin') {
+      const grantedPermission = await window.api.permissions.getMediaStatus('system-audio')
+      if (grantedPermission !== 'granted') {
+        stream.getTracks().forEach((track) => track.stop())
+        stream = null
+        await window.api.permissions.showGuide('screen-recording')
+        reset()
+        return
+      }
+    }
+
+    if (!stream.getAudioTracks().length) {
+      throw new Error('系统音频采集没有返回音频轨道')
+    }
+
+    // 权限与采集流都准备完成后才暂停播放，避免拒绝权限后播放被无谓打断。
+    if (audioStore.Audio.isPlay) {
+      wasPlaying.value = true
+      await audioStore.stop()
+    } else {
+      wasPlaying.value = false
+    }
 
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
@@ -170,16 +202,22 @@ async function start() {
   } catch (err: any) {
     console.error('启动录音失败', err)
     if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
-      MessagePlugin.error('音频采集权限被拒绝，请检查系统权限后重试')
+      const opened = await window.api.permissions.showGuide('screen-recording')
+      if (!opened) {
+        MessagePlugin.error('系统音频采集权限被拒绝，请检查系统设置后重试')
+      }
     } else {
-      MessagePlugin.error('启动录音失败，请检查权限')
+      MessagePlugin.error(err?.message || '启动系统音频采集失败')
     }
     reset()
   }
 }
 
 async function tryRecognize(blob: Blob) {
-  if (!running.value) return
+  if (!running.value || recognitionInFlight || chunks.length < 1) return
+  // 安卓端至少积累 5 秒音频后才发起匹配，避免短片段必然失败。
+  if (currentDuration.value < MIN_MATCH_DURATION && chunks.length === 1) return
+  recognitionInFlight = true
 
   try {
     const arrayBuffer = await blob.arrayBuffer()
@@ -203,30 +241,40 @@ async function tryRecognize(blob: Blob) {
         return
       }
 
+      const pcm16k = await resampleToMono(audioBuffer, 16000)
+      const shazamSamples = pcm16k.subarray(0, MAX_DURATION * 16000)
+      let shazamSignature
+      try {
+        shazamSignature = await generateShazamSignature(shazamSamples)
+      } catch (error) {
+        console.warn('[AudioRecognize] Shazam signature failed, using Netease fallback', error)
+      }
+
       const pcm8k = await resampleTo8kMono(audioBuffer)
-
+      const slice = pcm8k.subarray(0, MAX_DURATION * 8000)
       const gen = (window as any).GenerateFP
-      if (typeof gen === 'function') {
-        const fp = await gen(pcm8k)
-        console.log('[AudioRecognize] Generated FP length:', fp.length)
-
-        const result = await window.api.music.requestSdk('recognize', {
-          source: 'wy',
-          fp,
-          duration: audioBuffer.duration
-        })
-        console.log('[AudioRecognize] Recognition result:', result)
-        if (result && result.length > 0) {
-          recognizedSongs.value = result
-          status.value = 'success'
-          stopRecording(true)
-        }
+      const fp = typeof gen === 'function' ? await gen(slice) : undefined
+      const result = await window.api.music.requestSdk('recognize', {
+        source: 'wy',
+        fp,
+        shazamSignature,
+        duration: slice.length / 8000
+      })
+      console.log('[AudioRecognize] Recognition result:', result)
+      if (result && result.length > 0) {
+        recognizedSongs.value = result
+        status.value = 'success'
+        await stopRecording(true)
+        const first = result[0]
+        setTimeout(() => handleSearchResult(first), 450)
       }
     } finally {
       ctx.close()
     }
   } catch (e) {
     console.error('Recognition attempt failed', e)
+  } finally {
+    recognitionInFlight = false
   }
 }
 
@@ -263,70 +311,12 @@ async function stopRecording(success: boolean = false) {
   }
 }
 
-// File Upload Logic
-const fileInput = ref<HTMLInputElement | null>(null)
-
-function triggerUpload() {
-  fileInput.value?.click()
-}
-
-async function onFilePicked(e: Event) {
-  const file = (e.target as HTMLInputElement).files?.[0]
-  if (!file) return
-
-  if (running.value) return
-
-  status.value = 'processing'
-  running.value = true
-  recognizedSongs.value = []
-
-  try {
-    await ensureAFP()
-    const arrayBuffer = await file.arrayBuffer()
-    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
-
-    try {
-      const audioBuffer = await ctx.decodeAudioData(arrayBuffer)
-      const pcm8k = await resampleTo8kMono(audioBuffer)
-
-      // Take up to 15s of the file
-      const targetLength = MAX_DURATION * 8000
-      const slice = new Float32Array(Math.min(pcm8k.length, targetLength))
-      slice.set(pcm8k.subarray(0, slice.length))
-
-      const gen = (window as any).GenerateFP
-      if (typeof gen === 'function') {
-        const fp = await gen(slice)
-        const result = await window.api.music.requestSdk('recognize', {
-          source: 'wy',
-          fp,
-          duration: slice.length / 8000
-        })
-        if (result && result.length > 0) {
-          recognizedSongs.value = result
-          status.value = 'success'
-        } else {
-          status.value = 'failed'
-          MessagePlugin.warning('未识别到歌曲')
-        }
-      }
-    } finally {
-      ctx.close()
-    }
-  } catch (e) {
-    console.error('File recognition failed', e)
-    status.value = 'failed'
-    MessagePlugin.error('识别失败')
-  } finally {
-    running.value = false
-  }
-}
-
 function reset() {
   running.value = false
   status.value = ''
   currentDuration.value = 0
   chunks = []
+  recognitionInFlight = false
   if (stream) {
     stream.getTracks().forEach((t) => t.stop())
     stream = null
@@ -337,43 +327,12 @@ function reset() {
   }
 }
 
-function backToInitial() {
-  reset()
-  recognizedSongs.value = []
-}
-
-async function handlePlayResult(song: any) {
-  if (!song) return
-  localUserStore.addSongToFirst(song)
-  await playSong(song)
-
-  // Jump to recognized progress
-  if (song.startTime && song.startTime > 0) {
-    // startTime is usually in ms
-    const seconds = song.startTime / 1000
-    // Wait a bit for player to be ready or just set it
-    // The player might need time to load.
-    // playSong is async and waits for start(), but buffering might take time.
-    // However, setCurrentTime in store just sets the state, which should be fine if audio element is present.
-    setTimeout(() => {
-      audioStore.setCurrentTime(seconds)
-      if (audioStore.Audio.audio) {
-        audioStore.Audio.audio.currentTime = seconds
-      }
-      MessagePlugin.success(`已跳转至识别片段: ${formatTime(seconds)}`)
-    }, 500)
-  }
-}
-
-function formatTime(seconds: number) {
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
-}
-
 function handleSearchResult(song: any) {
   if (!song) return
-  searchStore.setValue(song.name)
+  const query = [song.name, song.singer].filter(Boolean).join(' ').trim()
+  if (!query) return
+  searchStore.setValue(query)
+  searchStore.addHistory(query)
   router.push({ name: 'search' })
 }
 
@@ -387,21 +346,28 @@ onUnmounted(() => {
     <div class="recognize-container">
       <div class="header">
         <h2>听歌识曲</h2>
-        <p class="subtitle">识别电脑正在播放的声音或上传音频文件</p>
+        <p class="subtitle">点击开始，识别电脑正在播放的声音</p>
       </div>
 
-      <div v-if="!recognizedSongs.length || running" class="visualizer-section">
-        <div class="circle-waves" :class="{ 'is-active': running }">
+      <button
+        class="microphone-button"
+        :class="{ 'is-active': running }"
+        type="button"
+        aria-label="开始听歌识曲"
+        :disabled="status === 'initializing'"
+        @click="running ? stopRecording(false) : start()"
+      >
+        <div class="circle-waves">
           <div class="wave"></div>
           <div class="wave"></div>
           <div class="wave"></div>
           <div class="icon-container">
-            <MicrophoneIcon size="48px" />
+            <SoundIcon size="88px" />
           </div>
         </div>
-      </div>
+      </button>
 
-      <div class="status-display">
+      <div class="status-slot" aria-live="polite">
         <template v-if="running">
           <p class="status-text">正在识别中... {{ currentDuration }}s / {{ MAX_DURATION }}s</p>
           <t-progress
@@ -410,72 +376,9 @@ onUnmounted(() => {
             :label="false"
           />
         </template>
-        <template v-else-if="recognizedSongs.length > 0">
-          <div class="result-list">
-            <div v-for="song in recognizedSongs" :key="song.songmid" class="result-item">
-              <div class="result-cover-wrapper">
-                <img :src="song.img" class="result-cover" />
-              </div>
-              <div class="result-content">
-                <h3>{{ song.name }}</h3>
-                <p>{{ song.singer }}</p>
-                <div v-if="song.startTime > 0" class="result-meta">
-                  <span>识别片段: {{ formatTime(song.startTime / 1000) }}</span>
-                </div>
-              </div>
-              <div class="result-actions">
-                <t-button theme="primary" shape="circle" @click="handlePlayResult(song)">
-                  <template #icon><PlayCircleIcon /></template>
-                </t-button>
-                <t-button
-                  theme="default"
-                  variant="outline"
-                  shape="circle"
-                  @click="handleSearchResult(song)"
-                >
-                  <template #icon><SearchIcon /></template>
-                </t-button>
-              </div>
-            </div>
-          </div>
-          <div class="result-footer">
-            <t-button theme="primary" variant="text" @click="backToInitial">
-              <template #icon><RefreshIcon /></template>
-              继续识别
-            </t-button>
-          </div>
-        </template>
-        <template v-else-if="status === 'failed'">
-          <p class="status-text error">未能识别到歌曲</p>
-          <t-button theme="default" variant="text" @click="start">重试</t-button>
-        </template>
-        <template v-else>
-          <p class="status-text">点击下方按钮开始</p>
-        </template>
-      </div>
-
-      <div v-if="recognizedSongs.length === 0" class="actions">
-        <t-button
-          shape="circle"
-          size="large"
-          theme="primary"
-          class="main-btn"
-          :loading="status === 'initializing' || status === 'processing'"
-          @click="running ? stopRecording(false) : start()"
-        >
-          <template #icon>
-            <StopCircleIcon v-if="running" size="36px" />
-            <PlayIcon v-else size="36px" />
-          </template>
-        </t-button>
-
-        <div class="sub-actions">
-          <t-button variant="text" theme="default" :disabled="running" @click="triggerUpload">
-            <template #icon><UploadIcon /></template>
-            上传文件
-          </t-button>
-        </div>
-        <input ref="fileInput" type="file" accept="audio/*" hidden @change="onFilePicked" />
+        <p v-else-if="status === 'initializing'" class="status-text">正在准备系统音频...</p>
+        <p v-else-if="status === 'success'" class="status-text success">识别成功，正在搜索...</p>
+        <p v-else-if="status === 'failed'" class="status-text error">没听出来，点击再试一次</p>
       </div>
     </div>
   </div>
@@ -495,14 +398,15 @@ onUnmounted(() => {
 .recognize-container {
   width: 100%;
   height: 100%;
-  padding: 24px;
   text-align: center;
   display: flex;
   flex-direction: column;
-  gap: 24px;
   transition: all 0.3s ease;
   overflow: hidden;
   align-items: center;
+  justify-content: center;
+  gap: 28px;
+  padding: 32px;
 }
 
 .header h2 {
@@ -525,10 +429,43 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
+.microphone-button {
+  width: 240px;
+  height: 240px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  outline: none;
+}
+
+.microphone-button:not(:disabled):hover .icon-container {
+  transform: scale(1.08);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.28);
+}
+
+.microphone-button:not(:disabled):active .icon-container {
+  transform: scale(0.96);
+}
+
+.microphone-button:focus-visible {
+  outline: 3px solid var(--td-brand-color);
+  outline-offset: 8px;
+}
+
+.microphone-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
 .circle-waves {
   position: relative;
-  width: 140px;
-  height: 140px;
+  width: 240px;
+  height: 240px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -536,8 +473,8 @@ onUnmounted(() => {
 
 .icon-container {
   z-index: 10;
-  width: 90px;
-  height: 90px;
+  width: 156px;
+  height: 156px;
   background: var(--td-brand-color);
   border-radius: 50%;
   display: flex;
@@ -545,7 +482,9 @@ onUnmounted(() => {
   justify-content: center;
   color: white;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
-  transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  transition:
+    transform 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275),
+    box-shadow 0.35s ease;
   overflow: hidden;
 }
 
@@ -592,6 +531,17 @@ onUnmounted(() => {
   }
 }
 
+.status-slot {
+  width: 100%;
+  max-width: 520px;
+  min-height: 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
 .status-display {
   width: 100%;
   max-width: 600px;
@@ -626,6 +576,10 @@ onUnmounted(() => {
 
 .status-text.error {
   color: var(--td-error-color);
+}
+
+.status-text.success {
+  color: var(--td-success-color);
 }
 
 /* Result List Styles */

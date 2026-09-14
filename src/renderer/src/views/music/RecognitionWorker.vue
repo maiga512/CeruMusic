@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
+import { generateShazamSignature } from '@renderer/utils/shazam'
 
 function loadScript(src: string) {
   return new Promise<void>((resolve, reject) => {
@@ -28,11 +28,11 @@ async function ensureAFP() {
   }
 }
 
-async function resampleTo8kMono(audioBuffer: AudioBuffer): Promise<Float32Array> {
+async function resampleToMono(audioBuffer: AudioBuffer, sampleRate: number): Promise<Float32Array> {
   const ctx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
     1,
-    Math.floor(audioBuffer.duration * 8000),
-    8000
+    Math.floor(audioBuffer.duration * sampleRate),
+    sampleRate
   )
 
   const source = ctx.createBufferSource()
@@ -42,6 +42,10 @@ async function resampleTo8kMono(audioBuffer: AudioBuffer): Promise<Float32Array>
 
   const renderedBuffer = await ctx.startRendering()
   return renderedBuffer.getChannelData(0)
+}
+
+async function resampleTo8kMono(audioBuffer: AudioBuffer): Promise<Float32Array> {
+  return resampleToMono(audioBuffer, 8000)
 }
 
 async function processFile(id: string, filePath: string) {
@@ -67,10 +71,15 @@ async function processFile(id: string, filePath: string) {
 
       const audioBuffer = await ctx.decodeAudioData(arrayBuffer)
 
-      // Resample
+      const pcm16k = await resampleToMono(audioBuffer, 16000)
+      let shazamSignature
+      try {
+        shazamSignature = await generateShazamSignature(pcm16k.subarray(0, 15 * 16000))
+      } catch (error) {
+        console.warn('Shazam signature failed, using Netease fallback', error)
+      }
       const pcm8k = await resampleTo8kMono(audioBuffer)
 
-      // Take up to 15s (same as recognize.vue logic)
       const MAX_DURATION = 15
       const targetLength = MAX_DURATION * 8000
       const slice = new Float32Array(Math.min(pcm8k.length, targetLength))
@@ -79,10 +88,10 @@ async function processFile(id: string, filePath: string) {
       const gen = (window as any).GenerateFP
       if (typeof gen === 'function') {
         const fp = await gen(slice)
-        // Send back result
         ;(window as any).electron.ipcRenderer.send('worker:fp-generated', {
           id,
           fp,
+          shazamSignature,
           duration: slice.length / 8000,
           originalDuration: audioBuffer.duration
         })

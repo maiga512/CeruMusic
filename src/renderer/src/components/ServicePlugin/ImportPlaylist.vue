@@ -37,7 +37,9 @@
             </div>
             <div class="playlist-info">
               <div class="playlist-name">{{ pl.name }}</div>
-              <div class="playlist-meta">{{ pl.songCount }} 首歌曲</div>
+              <div class="playlist-meta">
+                {{ pl.songCount > 0 ? `${pl.songCount} 首歌曲` : '歌曲数量同步后确定' }}
+              </div>
               <div v-if="pl.description" class="playlist-desc">{{ pl.description }}</div>
             </div>
             <div class="playlist-action">
@@ -125,6 +127,7 @@ async function importPlaylist(pl: ServicePlaylist) {
     if (result?.error) {
       MessagePlugin.error(`导入失败: ${result.error}`)
     } else if (result?.success) {
+      window.dispatchEvent(new Event('playlist-updated'))
       MessagePlugin.success(`成功导入 "${pl.name}"，共 ${result.data?.added || 0} 首歌曲`)
     }
   } catch (e: any) {

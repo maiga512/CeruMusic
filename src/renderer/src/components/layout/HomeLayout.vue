@@ -56,6 +56,11 @@ const menuList: MenuItem[] = [
     path: '/home/find'
   },
   {
+    name: '播客',
+    icon: 'icon-bofang',
+    path: '/home/podcast'
+  },
+  {
     name: '歌单',
     icon: 'icon-yanchu',
     path: '/home/songlist'
@@ -456,7 +461,7 @@ function checkGuide() {
                 </t-button>
               </t-tooltip>
 
-              <TitleBarControls :show-account="true"></TitleBarControls>
+              <TitleBarControls :show-account="false"></TitleBarControls>
             </div>
           </div>
 

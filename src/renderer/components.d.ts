@@ -69,6 +69,7 @@ declare module 'vue' {
     NTag: typeof import('naive-ui')['NTag']
     NText: typeof import('naive-ui')['NText']
     NUpload: typeof import('naive-ui')['NUpload']
+    PagerBar: typeof import('./src/components/Pager/PagerBar.vue')['default']
     PendingPanel: typeof import('./src/components/ListenTogether/parts/PendingPanel.vue')['default']
     PerformanceBackground: typeof import('./src/components/Play/PerformanceBackground.vue')['default']
     PlaylistActions: typeof import('./src/components/Play/PlaylistActions.vue')['default']

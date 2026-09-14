@@ -106,7 +106,7 @@ export type CeruCloudPlaylist = {
   total?: number;
 };
 
-export type CeruFavoriteEntityType = 'song' | 'playlist' | 'album' | 'artist' | 'rank';
+export type CeruFavoriteEntityType = 'song' | 'playlist' | 'album' | 'artist' | 'rank' | 'podcast';
 
 export type CeruPlaylistFavorite = {
   id: string;
@@ -136,9 +136,41 @@ export type CeruPlaylistFavoriteMutationInput = {
 export type CeruFavoriteMutationResult = {
   id?: string;
   playlistId?: string;
+  entityId?: string;
   updatedAt?: string;
   deletedAt?: string | null;
   revision?: number;
+};
+
+export type CeruPodcastFavorite = {
+  id: string;
+  radioId: string;
+  source?: CeruMusicSource;
+  title: string;
+  description?: string;
+  coverUrl?: string;
+  author?: string;
+  total?: number;
+  playCount?: string;
+  pinned?: boolean;
+  position?: number;
+  createdAt?: string;
+  updatedAt?: string;
+  deletedAt?: string | null;
+  revision?: number;
+};
+
+export type CeruPodcastFavoriteMutationInput = {
+  radioId: string;
+  source?: CeruMusicSource;
+  title: string;
+  description?: string;
+  coverUrl?: string;
+  author?: string;
+  total?: number;
+  playCount?: string;
+  pinned?: boolean;
+  position?: number;
 };
 
 export type CeruFavoriteSyncPage<T> = {

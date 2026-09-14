@@ -426,6 +426,15 @@ const pluginService = {
     return plugin.getServiceRole()
   },
 
+  getPluginIdByServiceRole(role: string): string | null {
+    for (const [pluginId, manager] of Object.entries(loadedPlugins)) {
+      try {
+        if ((manager as CeruMusicPluginHost).getServiceRole() === role) return pluginId
+      } catch {}
+    }
+    return null
+  },
+
   getConfigSchema(pluginId: string) {
     const plugin = this.getPluginById(pluginId)
     if (!plugin) throw new Error(`插件 ${pluginId} 未找到`)
@@ -460,7 +469,11 @@ const pluginService = {
     const plugin = this.getPluginById(pluginId)
     if (!plugin) throw new Error(`插件 ${pluginId} 未找到`)
     const config = getPluginConfig(pluginId)
-    return await plugin.testConnection(config)
+    const result: any = await plugin.testConnection(config)
+    if (result?.success && plugin.getServiceRole() === 'feiniu' && result.config) {
+      savePluginConfig(pluginId, { ...config, ...result.config })
+    }
+    return result
   },
 
   async getPlaylists(pluginId: string) {

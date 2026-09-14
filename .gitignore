@@ -16,3 +16,6 @@ temp/log.txt
 /.idea/
 docs/.vitepress/dist
 docs/.vitepress/cache
+._*
+dist-desktop-fix*/
+test-data/

@@ -68,6 +68,8 @@ export type FavoriteInput = {
   filePath?: string;
   ownerName?: string;
   metadata?: UnknownRecord;
+  position?: number;
+  pinned?: boolean;
 };
 
 export type UnknownRecord = Record<string, unknown>;

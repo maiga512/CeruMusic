@@ -6,6 +6,12 @@ import type {
   HotkeyConfigPayload,
   HotkeyStatus
 } from '../common/types/hotkeys'
+import type {
+  AppPlatform,
+  MediaPermissionKind,
+  MediaPermissionStatus,
+  PermissionGuideTarget
+} from '../common/types/permissions'
 // 自定义 API 接口
 interface CustomAPI {
   autoUpdater: any
@@ -27,6 +33,24 @@ interface CustomAPI {
       } & (MethodParams<T> extends object ? MethodParams<T> : { [key: string]: any })
     ) => ReturnType<MainApi[T]>
     invoke: (channel: string, ...args: any[]) => Promise<any>
+  }
+
+  podcast: {
+    getLoginState: () => Promise<any>
+    createQr: () => Promise<any>
+    checkQr: (key: string) => Promise<any>
+    logout: () => Promise<any>
+    getCategoryPage: (payload: any) => Promise<any>
+    getCategoryTotal: (payload: any) => Promise<any>
+    getHomeChannel: (payload: any) => Promise<any>
+    search: (payload: any) => Promise<any>
+    getPrograms: (payload: any) => Promise<any>
+    getRadioDetail: (radioId: string) => Promise<any>
+    getPlayUrl: (payload: any) => Promise<any>
+    getProgramLyric: (song: any) => Promise<any>
+    getRecommendations: (limit?: number) => Promise<any>
+    getCategories: () => Promise<any[]>
+    getCategoryPrograms: (categoryId: string, page?: number, limit?: number) => Promise<any>
   }
 
   musicCache: {
@@ -148,6 +172,7 @@ interface CustomAPI {
     reloadAllPlugins: () => Promise<any>
     getPluginLog: (pluginId: string) => Promise<any>
     appendPluginLog: (pluginId: string, level: string, ...args: any[]) => Promise<any>
+    onPlaylistsSynced: (callback: (summary: any) => void) => () => void
   }
   ping: (callback: Function<any>) => undefined
   pingService: {
@@ -224,7 +249,11 @@ interface CustomAPI {
   localMusic: {
     [x: string]: any
     selectDirs: () => Promise<string[]>
-    scan: (dirs: string[]) => Promise<any[]>
+    scan: (dirs: string[]) => Promise<{
+      ok: boolean
+      inaccessibleDirs?: Array<{ path: string; code?: string; message: string }>
+      message?: string
+    }>
     writeTags: (
       filePath: string,
       songInfo: any,
@@ -261,6 +290,15 @@ interface CustomAPI {
     prepareCapture: () => Promise<boolean>
     getDefaultScreenSourceId: () => Promise<string>
     getAllScreenSourceIds: () => Promise<string[]>
+  }
+
+  permissions: {
+    getPlatform: () => Promise<AppPlatform>
+    getMediaStatus: (kind: MediaPermissionKind) => Promise<MediaPermissionStatus>
+    prepareMediaCapture: (kind: MediaPermissionKind) => Promise<boolean>
+    requestMicrophone: () => Promise<boolean>
+    openSettings: (target: PermissionGuideTarget) => Promise<boolean>
+    showGuide: (target: PermissionGuideTarget) => Promise<boolean>
   }
 }
 

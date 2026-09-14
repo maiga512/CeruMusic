@@ -450,7 +450,18 @@ const scanLibrary = async () => {
       return
     }
     // clearScan()
-    await api.localMusic.scan(toRaw(scanDirs.value))
+    const result = await api.localMusic.scan(toRaw(scanDirs.value))
+    const inaccessibleDirs = Array.isArray(result?.inaccessibleDirs) ? result.inaccessibleDirs : []
+    if (inaccessibleDirs.length > 0) {
+      const permissionDenied = inaccessibleDirs.some(
+        (item: any) => item?.code === 'EACCES' || item?.code === 'EPERM'
+      )
+      if (permissionDenied) {
+        await window.api.permissions.showGuide('files-and-folders')
+      } else {
+        MessagePlugin.warning(`有 ${inaccessibleDirs.length} 个目录无法读取，请重新选择`)
+      }
+    }
   } catch (e: any) {
     console.error('本地扫描失败:', e)
     MessagePlugin.error(e?.message || '扫描失败')

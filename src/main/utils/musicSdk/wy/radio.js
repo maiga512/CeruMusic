@@ -2,6 +2,7 @@ import { httpFetch } from '../../request'
 import { formatPlayTime, sizeFormate, formatPlayCount } from '../../index'
 import { eapiRequest } from './utils/index'
 import { weapi } from './utils/crypto'
+import podcastOfficial from './podcastOfficial'
 
 const WY_WEB_HEADERS = {
   'User-Agent':
@@ -10,7 +11,8 @@ const WY_WEB_HEADERS = {
   referer: 'https://music.163.com/'
 }
 
-const pickImage = (...values) => values.find((value) => typeof value === 'string' && value.trim()) || ''
+const pickImage = (...values) =>
+  values.find((value) => typeof value === 'string' && value.trim()) || ''
 
 const pickPublishTime = (program = {}) =>
   [
@@ -60,10 +62,10 @@ const buildTypes = (song = {}) => {
 const mapRadio = (item) => ({
   id: String(item.id),
   name: item.name || '',
-  desc: item.desc || item.rcmdText || '',
+  desc: item.desc || item.description || item.rcmdText || '',
   img: pickImage(item.picUrl, item.picUrlStr, item.coverUrl),
-  author: item.dj?.nickname || item.dj?.userName || '',
-  total: item.programCount || 0,
+  author: item.dj?.nickname || item.dj?.userName || item.creatorName || '',
+  total: item.programCount || item.programsCount || 0,
   play_count: formatPlayCount(item.playCount || item.subCount || 0),
   source: 'wy'
 })
@@ -91,7 +93,20 @@ const mapProgram = (program, radioFallback = {}) => {
     typeUrl: {},
     contentType: 'radio-program',
     programId: program.id,
-    radioId: radio.id || radioFallback.id || '',
+    radioId: String(radio.id || radioFallback.id || ''),
+    radioName: radio.name || radioFallback.name || '',
+    radioDescription: radio.desc || radio.description || radioFallback.desc || '',
+    radioCover: pickImage(radio.picUrl, radio.picUrlStr, radio.coverUrl, radioFallback.img),
+    radioAuthor:
+      radio.author ||
+      radio.dj?.nickname ||
+      radio.dj?.userName ||
+      radioFallback.author ||
+      radioFallback.dj?.nickname ||
+      '',
+    radioTotal:
+      radio.total || radio.programCount || radio.programsCount || radioFallback.total || 0,
+    radioPlayCount: radio.play_count || radio.playCount || radioFallback.play_count || '',
     publishTime,
     publishDate: formatPublishDate(publishTime)
   }
@@ -100,7 +115,8 @@ const mapProgram = (program, radioFallback = {}) => {
 const readSearchResult = (body = {}) => {
   const result = body.result || body.data?.result || body['/api/cloudsearch/pc']?.result || {}
   const radios = result.djRadios || result.djRadiosResult?.djRadios || result.resources || []
-  const total = result.djRadiosCount || result.djRadiosResult?.djRadiosCount || result.totalCount || 0
+  const total =
+    result.djRadiosCount || result.djRadiosResult?.djRadiosCount || result.totalCount || 0
   return { radios, total }
 }
 
@@ -168,6 +184,41 @@ export default {
     return searchByFallbacks(keyword, page, limit)
   },
 
+  async getRecommendations({ limit = 20 } = {}) {
+    const result = await podcastOfficial.getRecommendations(limit)
+    const radios = (result.radios || []).map(mapRadio)
+    const programs = result.programs || []
+    return {
+      list: programs
+        .map((program) => mapProgram(program, program.radio || program.djRadio || {}))
+        .filter((program) => program.radioId),
+      radios,
+      sections: result.sections || [],
+      total: programs.length,
+      page: 1,
+      limit,
+      source: 'wy'
+    }
+  },
+
+  async getCategories() {
+    return await podcastOfficial.getCategories()
+  },
+
+  async getCategoryPrograms({ categoryId, page = 1, limit = 20 } = {}) {
+    const result = await podcastOfficial.getCategoryPrograms(categoryId, page, limit)
+    return {
+      list: result.list
+        .map((program) => mapProgram(program, program.radio || program.djRadio || {}))
+        .filter((program) => program.radioId),
+      radios: (result.radios || []).map(mapRadio),
+      total: result.total,
+      page,
+      limit,
+      source: 'wy'
+    }
+  },
+
   getPrograms({ radioId, page = 1, limit = 30, asc = false, radio } = {}) {
     if (!radioId) return Promise.resolve({ list: [], total: 0, page, limit, source: 'wy' })
     const offset = limit * (page - 1)
@@ -186,7 +237,9 @@ export default {
       if (body.code !== this.successCode) throw new Error('获取电台节目失败')
       const programs = body.programs || []
       return {
-        list: programs.filter((item) => item.mainSong || item.mainTrackId).map((item) => mapProgram(item, radio)),
+        list: programs
+          .filter((item) => item.mainSong || item.mainTrackId)
+          .map((item) => mapProgram(item, radio)),
         total: body.count || programs.length,
         page,
         limit,

@@ -1,6 +1,6 @@
-const mapSongsToCloud = (songs: readonly any[]): any[] => {
+const mapSongsToCloud = (songs: readonly any[], includePosition = false): any[] => {
   const origin = songs
-    .map((s) => {
+    .map((s, index) => {
       const _origin = {
         songmid: String(s.songmid),
         hash: s.hash,
@@ -11,7 +11,8 @@ const mapSongsToCloud = (songs: readonly any[]): any[] => {
         source: s.source,
         interval: s.interval,
         img: s.img,
-        types: s.types || []
+        types: s.types || [],
+        ...(includePosition ? { position: index } : {})
       }
       if (!_origin.hash) delete _origin.hash
       return _origin
