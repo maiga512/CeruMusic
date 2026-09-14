@@ -1216,6 +1216,7 @@ const onToggleLike = async (song: Song) => {
       const removeRes = await songListAPI.removeSong(id, song.songmid)
       if (removeRes.success && removeRes.data) {
         likedSet.value.delete(song.songmid)
+        window.dispatchEvent(new Event('playlist-updated'))
         syncRemoveSongsFromCloud(favoritesPlaylist, [song.songmid]).catch((error) => {
           console.error('同步取消喜欢到云端失败:', error)
           MessagePlugin.warning('本地已取消喜欢，云端同步稍后重试')
@@ -1228,6 +1229,7 @@ const onToggleLike = async (song: Song) => {
       const addRes = await songListAPI.addSongs(id, [toRaw(song) as any])
       if (addRes.success) {
         likedSet.value.add(song.songmid)
+        window.dispatchEvent(new Event('playlist-updated'))
         syncAddSongsToCloud(favoritesPlaylist, [toRaw(song) as any]).catch((error) => {
           console.error('同步喜欢到云端失败:', error)
           MessagePlugin.warning('本地已添加喜欢，云端同步稍后重试')

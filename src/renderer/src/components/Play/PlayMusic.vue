@@ -735,6 +735,7 @@ const onToggleLike = async () => {
       )
       if (removeRes.success && removeRes.data) {
         likeState.value = false
+        window.dispatchEvent(new Event('playlist-updated'))
         syncRemoveSongsFromCloud(favoritesPlaylist as any, [userInfo.value.lastPlaySongId as any]).catch(
           (error) => {
             console.error('同步取消喜欢到云端失败:', error)
@@ -751,6 +752,7 @@ const onToggleLike = async () => {
       ])
       if (addRes.success) {
         likeState.value = true
+        window.dispatchEvent(new Event('playlist-updated'))
         syncAddSongsToCloud(favoritesPlaylist as any, [_.cloneDeep(toRaw(currentSong)) as any]).catch(
           (error) => {
             console.error('同步喜欢到云端失败:', error)

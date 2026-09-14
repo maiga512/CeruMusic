@@ -487,6 +487,28 @@ const fetchLocalPlaylistSongs = async () => {
   }
 }
 
+let localPlaylistRefreshTimer: ReturnType<typeof setTimeout> | null = null
+const handlePlaylistUpdatedForCurrentView = () => {
+  if (!isLocalPlaylist.value) return
+  if (localPlaylistRefreshTimer) clearTimeout(localPlaylistRefreshTimer)
+  localPlaylistRefreshTimer = setTimeout(() => {
+    localPlaylistRefreshTimer = null
+    void fetchLocalPlaylistSongs()
+  }, 80)
+}
+
+onMounted(() => {
+  window.addEventListener('playlist-updated', handlePlaylistUpdatedForCurrentView)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('playlist-updated', handlePlaylistUpdatedForCurrentView)
+  if (localPlaylistRefreshTimer) {
+    clearTimeout(localPlaylistRefreshTimer)
+    localPlaylistRefreshTimer = null
+  }
+})
+
 const cloudNextPos = ref<number | undefined>(undefined)
 const playlistShareNextPos = ref<number | undefined>(undefined)
 
