@@ -11,6 +11,7 @@ import type {
   PlaylistInput,
   PlaylistPatchInput,
   PlaylistSongMutationInput,
+  PlaylistSongOperationInput,
   RequestContext,
   SyncEvent,
   UnknownRecord,
@@ -165,6 +166,22 @@ type SyncEventRow = {
   action: string;
   payload_json: string;
   deleted_at: string | null;
+  created_at: string;
+};
+
+type PlaylistSongOperationRow = {
+  operation_id: string;
+  user_id: string;
+  device_id: string;
+  sequence: number;
+  playlist_id: string;
+  action: string;
+  track_key: string;
+  applied: number;
+  changed: number;
+  stale: number;
+  result_json: string;
+  revision: number;
   created_at: string;
 };
 
@@ -740,6 +757,293 @@ export class SyncDatabase {
     });
   }
 
+  applySongOperation(userId: string, input: PlaylistSongOperationInput) {
+    const operationId = getText(input.operationId);
+    const deviceId = getText(input.deviceId);
+    const playlistId = getText(input.playlistId);
+    const action = input.action === 'remove' ? 'remove' : input.action === 'add' ? 'add' : null;
+    const sequence = Number(input.sequence);
+    if (!operationId || !deviceId || !playlistId || !action || !Number.isSafeInteger(sequence) || sequence < 1) {
+      const error = new Error('operationId、deviceId、sequence、playlistId、action 必须有效');
+      Object.assign(error, {statusCode: 400});
+      throw error;
+    }
+
+    const normalizedSong = action === 'add' && input.song && typeof input.song === 'object'
+      ? normalizeSong(input.song)
+      : null;
+    const trackKey = getText(input.trackKey) || normalizedSong?.trackKey || '';
+    if (!trackKey) {
+      const error = new Error('trackKey 不能为空');
+      Object.assign(error, {statusCode: 400});
+      throw error;
+    }
+    if (
+      action === 'add' &&
+      (!normalizedSong ||
+        !ALLOWED_CLOUD_SONG_SOURCES.has(normalizedSong.source) ||
+        normalizedSong.trackKey.startsWith('local:'))
+    ) {
+      const error = new Error('只能同步受支持的云端歌曲');
+      Object.assign(error, {statusCode: 400});
+      throw error;
+    }
+
+    return this.db.transaction(() => {
+      const existingOperation = this.db
+        .prepare(
+          `SELECT * FROM playlist_song_operations
+           WHERE user_id = ? AND operation_id = ?`,
+        )
+        .get(userId, operationId) as PlaylistSongOperationRow | undefined;
+      if (existingOperation) {
+        return parseJson<UnknownRecord>(existingOperation.result_json, {
+          operationId,
+          applied: Boolean(existingOperation.applied),
+          changed: Boolean(existingOperation.changed),
+          stale: Boolean(existingOperation.stale),
+          action: existingOperation.action,
+          trackKey: existingOperation.track_key,
+          removedCount: 0,
+          revision: existingOperation.revision,
+          updatedAt: existingOperation.created_at,
+        });
+      }
+
+      const at = nowIso();
+      const persistResult = (
+        result: Record<string, unknown>,
+        revision: number,
+        applied: boolean,
+        changed: boolean,
+        stale: boolean,
+      ) => {
+        this.db
+          .prepare(
+            `INSERT INTO playlist_song_operations
+             (operation_id, user_id, device_id, sequence, playlist_id, action, track_key,
+              applied, changed, stale, result_json, revision, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            operationId,
+            userId,
+            deviceId,
+            sequence,
+            playlistId,
+            action,
+            trackKey,
+            applied ? 1 : 0,
+            changed ? 1 : 0,
+            stale ? 1 : 0,
+            json(result),
+            revision,
+            at,
+          );
+        return result;
+      };
+      const currentRevision = this.getCurrentRevision(userId);
+      const newerOperation = this.db
+        .prepare(
+          `SELECT operation_id
+           FROM playlist_song_operations
+           WHERE user_id = ? AND device_id = ? AND track_key = ? AND sequence > ?
+           LIMIT 1`,
+        )
+        .get(userId, deviceId, trackKey, sequence) as {operation_id: string} | undefined;
+      if (newerOperation) {
+        return persistResult(
+          {
+            operationId,
+            applied: false,
+            changed: false,
+            stale: true,
+            action,
+            trackKey,
+            removedCount: 0,
+            revision: currentRevision,
+            updatedAt: at,
+          },
+          currentRevision,
+          false,
+          false,
+          true,
+        );
+      }
+
+      if (!this.getPlaylistRow(userId, playlistId)) {
+        const error = new Error('歌单不存在');
+        Object.assign(error, {statusCode: 404});
+        throw error;
+      }
+
+      const currentRows = this.db
+        .prepare(`SELECT * FROM playlist_songs WHERE user_id = ? AND playlist_id = ? AND deleted_at IS NULL`)
+        .all(userId, playlistId) as PlaylistSongRow[];
+
+      if (action === 'remove') {
+        const remove = currentRows.filter((row) => {
+          if (row.track_key === trackKey) return true;
+          const song = parseJson<UnknownRecord>(row.track_json, {});
+          return String(song.id || song.songmid || song.hash || '') === trackKey.substring(trackKey.indexOf(':') + 1);
+        });
+        if (remove.length === 0) {
+          return persistResult(
+            {
+              operationId,
+              applied: false,
+              changed: false,
+              stale: false,
+              action,
+              trackKey,
+              removedCount: 0,
+              revision: currentRevision,
+              updatedAt: at,
+            },
+            currentRevision,
+            false,
+            false,
+            false,
+          );
+        }
+
+        const revision = this.nextRevision(userId);
+        for (const row of remove) {
+          this.db
+            .prepare(`UPDATE playlist_songs SET revision = ?, deleted_at = ?, updated_at = ? WHERE id = ? AND user_id = ?`)
+            .run(revision, at, at, row.id, userId);
+        }
+        this.touchPlaylist(userId, playlistId, revision, at);
+        this.recordEvent(
+          userId,
+          revision,
+          'playlistSongs',
+          playlistId,
+          'delete',
+          {
+            playlistId,
+            songIds: remove.map((row) => row.track_key),
+            trackKey,
+            operationId,
+            deviceId,
+            sequence,
+            action,
+            removedCount: remove.length,
+          },
+          at,
+          at,
+        );
+        return persistResult(
+          {
+            operationId,
+            applied: true,
+            changed: true,
+            stale: false,
+            action,
+            trackKey,
+            removedCount: remove.length,
+            revision,
+            updatedAt: at,
+          },
+          revision,
+          true,
+          true,
+          false,
+        );
+      }
+
+      const existing = currentRows.find((row) => row.track_key === trackKey);
+      if (existing) {
+        return persistResult(
+          {
+            operationId,
+            applied: true,
+            changed: false,
+            stale: false,
+            action,
+            trackKey,
+            removedCount: 0,
+            revision: currentRevision,
+            updatedAt: at,
+          },
+          currentRevision,
+          true,
+          false,
+          false,
+        );
+      }
+
+      const revision = this.nextRevision(userId);
+      this.db
+        .prepare(
+          `UPDATE playlist_songs
+           SET sort_order = sort_order + 1
+           WHERE user_id = ? AND playlist_id = ? AND deleted_at IS NULL`,
+        )
+        .run(userId, playlistId);
+      this.insertOrUpdatePlaylistSong({
+        id: createId('trk'),
+        user_id: userId,
+        playlist_id: playlistId,
+        track_key: trackKey,
+        track_json: json({
+          id: normalizedSong!.id,
+          source: normalizedSong!.source,
+          title: normalizedSong!.title,
+          artist: normalizedSong!.artist,
+          album: normalizedSong!.album,
+          albumId: normalizedSong!.albumId,
+          durationText: normalizedSong!.durationText,
+          artworkUrl: normalizedSong!.artworkUrl,
+          qualities: normalizedSong!.qualities,
+          position: 0,
+        }),
+        sort_order: 0,
+        revision,
+        deleted_at: null,
+        created_at: at,
+        updated_at: at,
+      });
+      this.touchPlaylist(userId, playlistId, revision, at);
+      this.recordEvent(
+        userId,
+        revision,
+        'playlistSongs',
+        playlistId,
+        'upsert',
+        {
+          playlistId,
+          songs: [{...normalizedSong!, position: 0}],
+          trackKey,
+          operationId,
+          deviceId,
+          sequence,
+          action,
+          removedCount: 0,
+        },
+        null,
+        at,
+      );
+      return persistResult(
+        {
+          operationId,
+          applied: true,
+          changed: true,
+          stale: false,
+          action,
+          trackKey,
+          removedCount: 0,
+          revision,
+          updatedAt: at,
+        },
+        revision,
+        true,
+        true,
+        false,
+      );
+    })();
+  }
+
   listFavorites(userId: string, entityType?: string) {
     const type = entityType ? normalizeFavoriteEntityType(entityType) : null;
     const rows = type
@@ -992,10 +1296,30 @@ export class SyncDatabase {
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS playlist_song_operations (
+        operation_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        playlist_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        track_key TEXT NOT NULL,
+        applied INTEGER NOT NULL,
+        changed INTEGER NOT NULL,
+        stale INTEGER NOT NULL DEFAULT 0,
+        result_json TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(user_id, operation_id),
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
       CREATE INDEX IF NOT EXISTS idx_playlists_user_revision ON playlists(user_id, revision);
       CREATE INDEX IF NOT EXISTS idx_playlist_songs_user_revision ON playlist_songs(user_id, revision);
       CREATE INDEX IF NOT EXISTS idx_favorites_user_revision ON favorites(user_id, revision);
       CREATE INDEX IF NOT EXISTS idx_sync_events_user_revision ON sync_events(user_id, revision);
+      CREATE INDEX IF NOT EXISTS idx_playlist_song_ops_order
+        ON playlist_song_operations(user_id, device_id, track_key, sequence);
       CREATE INDEX IF NOT EXISTS idx_pair_codes_hash ON pair_codes(code_hash, expires_at, used_at);
     `);
 
@@ -1006,6 +1330,10 @@ export class SyncDatabase {
     const pairColumns = this.db.prepare(`PRAGMA table_info(pair_codes)`).all() as Array<{name: string}>;
     if (!pairColumns.some((column) => column.name === 'code')) {
       this.db.prepare(`ALTER TABLE pair_codes ADD COLUMN code TEXT`).run();
+    }
+    const operationColumns = this.db.prepare(`PRAGMA table_info(playlist_song_operations)`).all() as Array<{name: string}>;
+    if (!operationColumns.some((column) => column.name === 'stale')) {
+      this.db.prepare(`ALTER TABLE playlist_song_operations ADD COLUMN stale INTEGER NOT NULL DEFAULT 0`).run();
     }
     this.coalesceDuplicateIdentityPlaylists();
     this.sanitizePlaylistSongOrder();

@@ -205,6 +205,9 @@ watch(
   () => refreshLikeState()
 )
 onMounted(() => refreshLikeState())
+const handleFavoriteSyncUpdated = () => {
+  void refreshLikeState()
+}
 
 // === Windows 任务栏缩略图工具栏（Thumbnail Toolbar）状态同步 ===
 const thumbarApi = (window as any).api?.thumbar
@@ -572,6 +575,7 @@ onMounted(async () => {
     desktopLyricLocked.value = !!lock
   } catch {}
   window.addEventListener('global-music-control', globalControls)
+  window.addEventListener('playlist-updated', handleFavoriteSyncUpdated)
   window.addEventListener('ceru-window-state-change', syncAppWindowVisibleState)
   window.addEventListener('ceru-wake', syncAppWindowVisibleState)
   syncAppWindowVisibleState()
@@ -617,6 +621,7 @@ onUnmounted(() => {
     window.electron?.ipcRenderer?.removeListener?.('closeDesktopLyric', lyricCloseHandler)
   }
   window.removeEventListener('global-music-control', globalControls)
+  window.removeEventListener('playlist-updated', handleFavoriteSyncUpdated)
   window.removeEventListener('ceru-window-state-change', syncAppWindowVisibleState)
   window.removeEventListener('ceru-wake', syncAppWindowVisibleState)
   if (openPlaylistHandler) window.removeEventListener('open-playlist', openPlaylistHandler)

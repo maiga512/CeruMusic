@@ -23,6 +23,7 @@ import {
 import { mapCloudSongToLocal, mapSongsToCloud } from '@renderer/utils/playlist/cloudList'
 import {
   ensureLocalFavoritesPlaylist,
+  flushPendingFavoriteSongOperations,
   markPlaylistCloudSyncOk
 } from '@renderer/utils/playlist/cloudLibrarySync'
 import type { SongList, Songs } from '@common/types/songList'
@@ -321,6 +322,20 @@ const applyRemoteEvent = async (event: NasSyncEvent) => {
     if (!remoteId) return
     const existing = await getLocalPlaylistByRemoteId(remoteId)
     if (!existing) return
+    if (payload.operationId && payload.action === 'add' && Array.isArray(payload.songs)) {
+      const songs = payload.songs
+        .map((song: unknown) => mapCloudSongToLocal(song) as Songs)
+        .filter((song) => song.songmid)
+      if (songs.length > 0) await songListAPI.addSongs(existing.id, songs)
+      return
+    }
+    if (payload.operationId && payload.action === 'remove') {
+      const songmids = (Array.isArray(payload.songIds) ? payload.songIds : [payload.trackKey])
+        .map((value: unknown) => String(value || '').substring(String(value || '').indexOf(':') + 1))
+        .filter(Boolean)
+      if (songmids.length > 0) await songListAPI.removeSongs(existing.id, songmids)
+      return
+    }
     const detail = await nasPlaylistAPI.getSongs(remoteId).catch(() => null)
     const songs = detail?.songs || detail?.list || payload.songs || []
     await replaceLocalPlaylistSongs(existing.id, songs)
@@ -532,6 +547,7 @@ const restoreCloudLibraryToLocal = async (reason: string) => {
 }
 
 const runAutoSync = async (reason: string) => {
+  await flushPendingFavoriteSongOperations()
   await flushPendingPodcastFavoriteMutations()
   await cleanupStaleBridgedCloudCopies()
   const sinceRevision = await getScopedNasSyncLastRevision()
@@ -597,6 +613,7 @@ const pollNasSync = async () => {
       return
     }
 
+    await flushPendingFavoriteSongOperations()
     const sinceRevision = await getScopedNasSyncLastRevision()
     const visible = isAppWindowVisible()
     const result = visible && !syncServerOffline

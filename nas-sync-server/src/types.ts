@@ -53,6 +53,16 @@ export type PlaylistSongMutationInput = {
   trackKeys?: string[];
 };
 
+export type PlaylistSongOperationInput = {
+  operationId?: string;
+  deviceId?: string;
+  sequence?: number;
+  playlistId?: string;
+  action?: 'add' | 'remove';
+  trackKey?: string;
+  song?: UnknownRecord;
+};
+
 export type FavoriteInput = {
   entityType?: CeruFavoriteEntityType;
   entityId?: string;

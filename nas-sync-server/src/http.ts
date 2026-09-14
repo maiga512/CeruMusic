@@ -488,6 +488,12 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
     POST: ({auth, body}) => database.addSongs(requireAuth(auth).user.id, body),
     DELETE: ({auth, body}) => database.removeSongs(requireAuth(auth).user.id, body),
   },
+  '/playlist-song-ops': {
+    POST: ({auth, body}) => database.applySongOperation(requireAuth(auth).user.id, body),
+  },
+  '/playlist-song-operations': {
+    POST: ({auth, body}) => database.applySongOperation(requireAuth(auth).user.id, body),
+  },
   '/playlist-favorites': {
     GET: ({auth}) => ({items: database.listFavorites(requireAuth(auth).user.id, 'playlist')}),
     POST: ({auth, body}) => database.upsertFavorite(requireAuth(auth).user.id, {...body, entityType: 'playlist'}),

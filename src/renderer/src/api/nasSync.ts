@@ -54,6 +54,18 @@ export type NasSyncServerParts = {
   path: string
 }
 
+export type NasPlaylistSongOperationResult = {
+  operationId: string
+  applied: boolean
+  changed: boolean
+  stale: boolean
+  action: 'add' | 'remove'
+  trackKey: string
+  removedCount: number
+  revision: number
+  updatedAt: string
+}
+
 export const parseNasSyncServerUrl = (serverUrl?: string): NasSyncServerParts | null => {
   const raw = String(serverUrl || '').trim()
   if (!raw) return null
@@ -376,7 +388,20 @@ export const nasSyncAPI = {
   waitForSync: (sinceRevision: number, timeoutMs = 20_000) =>
     requestNas<{ revision: number; events: unknown[] }>(
       `/sync/wait?sinceRevision=${sinceRevision}&timeout=${Math.max(0, Math.floor(timeoutMs))}`
-    )
+    ),
+  applyPlaylistSongOperation: (input: {
+    operationId: string
+    deviceId: string
+    sequence: number
+    playlistId: string
+    action: 'add' | 'remove'
+    trackKey: string
+    song?: CloudSongDto
+  }) =>
+    requestNas<NasPlaylistSongOperationResult>('/playlist-song-ops', {
+      method: 'POST',
+      body: input
+    })
 }
 
 export const nasCloudSongListAPI = {
