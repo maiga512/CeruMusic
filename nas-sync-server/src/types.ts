@@ -32,6 +32,7 @@ export type PlaylistInput = {
   semanticType?: string;
   source?: string;
   sourcePlaylistId?: string;
+  orderOnly?: boolean;
   songs?: UnknownRecord[];
   songlist?: UnknownRecord[] | string;
 };
@@ -57,6 +58,7 @@ export type PlaylistSongOperationInput = {
   operationId?: string;
   deviceId?: string;
   sequence?: number;
+  occurredAtMs?: number;
   playlistId?: string;
   action?: 'add' | 'remove';
   trackKey?: string;

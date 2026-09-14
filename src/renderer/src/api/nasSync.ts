@@ -393,6 +393,7 @@ export const nasSyncAPI = {
     operationId: string
     deviceId: string
     sequence: number
+    occurredAtMs: number
     playlistId: string
     action: 'add' | 'remove'
     trackKey: string
@@ -436,6 +437,7 @@ export const nasCloudSongListAPI = {
         cover: coverToString(data.cover),
         source: (data as any).source,
         semanticType: (data as any).semanticType,
+        orderOnly: (data as any).orderOnly,
         songlist: data.songlist
       }
     }),

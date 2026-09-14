@@ -174,6 +174,7 @@ type PlaylistSongOperationRow = {
   user_id: string;
   device_id: string;
   sequence: number;
+  occurred_at_ms: number;
   playlist_id: string;
   action: string;
   track_key: string;
@@ -670,8 +671,12 @@ export class SyncDatabase {
         )
         .run(next);
 
-      if (input.songlist || input.songs) {
-        this.replacePlaylistSongs(userId, playlistId, parseJsonArray(input.songlist || input.songs), revision, at);
+      const snapshotSongs = parseJsonArray(input.songlist || input.songs);
+      if (
+        (input.songlist || input.songs) &&
+        this.canReplaceFavoriteSongsFromSnapshot(userId, existing, snapshotSongs, input.orderOnly === true)
+      ) {
+        this.replacePlaylistSongs(userId, playlistId, snapshotSongs, revision, at);
       }
 
       const total = this.countSongs(userId, playlistId);
@@ -719,6 +724,16 @@ export class SyncDatabase {
       const deleted = this.deletePlaylist(userId, playlistId);
       return deleted ? {...deleted, skipped: true, reason: 'bridged-playlist-excluded'} : null;
     }
+    if (preview?.semantic_type === FAVORITES_SEMANTIC) {
+      return {
+        id: playlistId,
+        playlistId,
+        skipped: true,
+        reason: 'favorites-require-operation',
+        revision: this.getCurrentRevision(userId),
+        updatedAt: nowIso(),
+      };
+    }
 
     return this.writeTransaction(userId, (revision, at) => {
       if (!this.getPlaylistRow(userId, playlistId)) return null;
@@ -733,6 +748,17 @@ export class SyncDatabase {
   removeSongs(userId: string, input: PlaylistSongMutationInput) {
     const playlistId = getText(input.playlistId) || getText(input.listId) || getText(input.id);
     if (!playlistId) return null;
+    const preview = this.getPlaylistRow(userId, playlistId);
+    if (preview?.semantic_type === FAVORITES_SEMANTIC) {
+      return {
+        id: playlistId,
+        playlistId,
+        skipped: true,
+        reason: 'favorites-require-operation',
+        revision: this.getCurrentRevision(userId),
+        updatedAt: nowIso(),
+      };
+    }
     const ids = [...(input.songIds || []), ...(input.songmids || []), ...(input.trackKeys || [])].map(String).filter(Boolean);
 
     return this.writeTransaction(userId, (revision, at) => {
@@ -768,6 +794,10 @@ export class SyncDatabase {
       Object.assign(error, {statusCode: 400});
       throw error;
     }
+    const requestedOccurredAtMs = Number(input.occurredAtMs);
+    const occurredAtMs = Number.isSafeInteger(requestedOccurredAtMs) && requestedOccurredAtMs > 0
+      ? requestedOccurredAtMs
+      : Date.now();
 
     const normalizedSong = action === 'add' && input.song && typeof input.song === 'object'
       ? normalizeSong(input.song)
@@ -822,8 +852,8 @@ export class SyncDatabase {
           .prepare(
             `INSERT INTO playlist_song_operations
              (operation_id, user_id, device_id, sequence, playlist_id, action, track_key,
-              applied, changed, stale, result_json, revision, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              occurred_at_ms, applied, changed, stale, result_json, revision, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             operationId,
@@ -833,6 +863,7 @@ export class SyncDatabase {
             playlistId,
             action,
             trackKey,
+            occurredAtMs,
             applied ? 1 : 0,
             changed ? 1 : 0,
             stale ? 1 : 0,
@@ -863,6 +894,51 @@ export class SyncDatabase {
             removedCount: 0,
             revision: currentRevision,
             updatedAt: at,
+          },
+          currentRevision,
+          false,
+          false,
+          true,
+        );
+      }
+
+      const latestTrackOperation = this.db
+        .prepare(
+          `SELECT operation_id, device_id, sequence, occurred_at_ms
+           FROM playlist_song_operations
+           WHERE user_id = ? AND playlist_id = ? AND track_key = ?
+           ORDER BY occurred_at_ms DESC, operation_id DESC
+           LIMIT 1`,
+        )
+        .get(userId, playlistId, trackKey) as
+          | {operation_id: string; device_id: string; sequence: number; occurred_at_ms: number}
+          | undefined;
+      const latestSameDevice = latestTrackOperation?.device_id === deviceId;
+      if (
+        latestTrackOperation &&
+        (
+          (latestSameDevice
+            ? sequence <= Number(latestTrackOperation.sequence || 0)
+            : occurredAtMs < Number(latestTrackOperation.occurred_at_ms || 0) ||
+              (
+                occurredAtMs === Number(latestTrackOperation.occurred_at_ms || 0) &&
+                operationId <= latestTrackOperation.operation_id
+              ))
+        )
+      ) {
+        return persistResult(
+          {
+            operationId,
+            applied: false,
+            changed: false,
+            stale: true,
+            action,
+            trackKey,
+            removedCount: 0,
+            revision: currentRevision,
+            updatedAt: at,
+            winningOperationId: latestTrackOperation.operation_id,
+            winningOccurredAtMs: Number(latestTrackOperation.occurred_at_ms || 0),
           },
           currentRevision,
           false,
@@ -1301,6 +1377,7 @@ export class SyncDatabase {
         user_id TEXT NOT NULL,
         device_id TEXT NOT NULL,
         sequence INTEGER NOT NULL,
+        occurred_at_ms INTEGER NOT NULL DEFAULT 0,
         playlist_id TEXT NOT NULL,
         action TEXT NOT NULL,
         track_key TEXT NOT NULL,
@@ -1335,6 +1412,19 @@ export class SyncDatabase {
     if (!operationColumns.some((column) => column.name === 'stale')) {
       this.db.prepare(`ALTER TABLE playlist_song_operations ADD COLUMN stale INTEGER NOT NULL DEFAULT 0`).run();
     }
+    if (!operationColumns.some((column) => column.name === 'occurred_at_ms')) {
+      this.db.prepare(`ALTER TABLE playlist_song_operations ADD COLUMN occurred_at_ms INTEGER NOT NULL DEFAULT 0`).run();
+    }
+    this.db
+      .prepare(
+        `UPDATE playlist_song_operations
+         SET occurred_at_ms = COALESCE(
+           CAST(strftime('%s', created_at) AS INTEGER) * 1000,
+           CAST(strftime('%s', 'now') AS INTEGER) * 1000
+         )
+         WHERE occurred_at_ms <= 0`,
+      )
+      .run();
     this.coalesceDuplicateIdentityPlaylists();
     this.sanitizePlaylistSongOrder();
     this.ensurePlaylistIdentityIndexes();
@@ -1537,8 +1627,12 @@ export class SyncDatabase {
       )
       .run(next);
 
-    if (input.songlist || input.songs) {
-      this.replacePlaylistSongs(userId, existing.id, parseJsonArray(input.songlist || input.songs), revision, at);
+    const snapshotSongs = parseJsonArray(input.songlist || input.songs);
+    if (
+      (input.songlist || input.songs) &&
+      this.canReplaceFavoriteSongsFromSnapshot(userId, existing, snapshotSongs, input.orderOnly === true)
+    ) {
+      this.replacePlaylistSongs(userId, existing.id, snapshotSongs, revision, at);
     }
 
     const total = this.countSongs(userId, existing.id);
@@ -1688,6 +1782,41 @@ export class SyncDatabase {
       .prepare(`SELECT COUNT(*) AS total FROM playlist_songs WHERE user_id = ? AND playlist_id = ? AND deleted_at IS NULL`)
       .get(userId, playlistId) as {total: number};
     return row.total;
+  }
+
+  private canReplaceFavoriteSongsFromSnapshot(
+    userId: string,
+    playlist: PlaylistRow,
+    songs: UnknownRecord[],
+    orderOnly: boolean,
+  ) {
+    if (playlist.semantic_type !== FAVORITES_SEMANTIC) return true;
+    const nextKeys = new Set(normalizePlaylistSongs(songs).map((song) => song.trackKey));
+    if (orderOnly) {
+      const currentKeys = new Set(
+        (
+          this.db
+            .prepare(
+              `SELECT track_key
+               FROM playlist_songs
+               WHERE user_id = ? AND playlist_id = ? AND deleted_at IS NULL`,
+            )
+            .all(userId, playlist.id) as Array<{track_key: string}>
+        ).map((row) => row.track_key),
+      );
+      return (
+        nextKeys.size === currentKeys.size &&
+        [...nextKeys].every((trackKey) => currentKeys.has(trackKey))
+      );
+    }
+    const operationCount = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total
+         FROM playlist_song_operations
+         WHERE user_id = ? AND playlist_id = ?`,
+      )
+      .get(userId, playlist.id) as {total: number};
+    return Number(operationCount.total || 0) === 0 && this.countSongs(userId, playlist.id) === 0;
   }
 
   private touchPlaylist(userId: string, playlistId: string, revision: number, at: string) {

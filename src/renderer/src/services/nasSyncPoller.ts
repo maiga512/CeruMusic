@@ -22,6 +22,7 @@ import {
 } from '@renderer/utils/playlist/bridgedPlaylist'
 import { mapCloudSongToLocal, mapSongsToCloud } from '@renderer/utils/playlist/cloudList'
 import {
+  FAVORITES_PLAYLIST_NAME,
   ensureLocalFavoritesPlaylist,
   flushPendingFavoriteSongOperations,
   markPlaylistCloudSyncOk
@@ -378,7 +379,8 @@ const uploadPlaylistSnapshot = async (playlist: SongList) => {
   const songsRes = await songListAPI.getSongs(playlist.id)
   const songs = songsRes.success && Array.isArray(songsRes.data) ? songsRes.data : []
   if (isBridgedPlaylist(playlist, songs)) return null
-  const semanticType = playlist.meta?.semantic === 'favorites' ? 'favorites' : playlist.meta?.semantic
+  const isFavorites = playlist.meta?.semantic === 'favorites' || playlist.name === FAVORITES_PLAYLIST_NAME
+  const semanticType = isFavorites ? 'favorites' : playlist.meta?.semantic
   let remoteId = playlist.meta?.cloudId
 
   if (!remoteId) {
@@ -395,6 +397,13 @@ const uploadPlaylistSnapshot = async (playlist: SongList) => {
   }
 
   if (remoteId) {
+    let shouldSeedSongs = false
+    if (isFavorites) {
+      await flushPendingFavoriteSongOperations()
+      const detail = await nasPlaylistAPI.getSongs(remoteId).catch(() => null)
+      const remoteSongs = detail?.songs || detail?.list || []
+      shouldSeedSongs = remoteSongs.length === 0 && songs.length > 0
+    }
     const result = await nasPlaylistAPI.upsert(remoteId, {
       listId: remoteId,
       localId: playlist.id,
@@ -403,7 +412,7 @@ const uploadPlaylistSnapshot = async (playlist: SongList) => {
       cover: playlist.coverImgUrl && playlist.coverImgUrl !== 'default-cover' ? playlist.coverImgUrl : undefined,
       source: playlist.source,
       semanticType,
-      songlist: mapSongsToCloud(songs, true)
+      songlist: !isFavorites || shouldSeedSongs ? mapSongsToCloud(songs, true) : undefined
     })
     await markPlaylistCloudSyncOk(playlist, remoteId, result.updatedAt)
     return result

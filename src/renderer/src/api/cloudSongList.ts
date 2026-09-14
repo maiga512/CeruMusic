@@ -54,6 +54,8 @@ export interface UpdateUserSongListDto {
   name?: string
   describe?: string
   cover?: string | File
+  semanticType?: string
+  orderOnly?: boolean
   songlist?: CloudSongDto[]
 }
 

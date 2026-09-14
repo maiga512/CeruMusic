@@ -20,11 +20,13 @@ export const FAVORITES_PLAYLIST_NAME = '我的喜欢'
 const SONG_OPERATION_QUEUE_KEY = 'ceru_nas_playlist_song_operations'
 const SONG_OPERATION_SEQUENCE_KEY = 'ceru_nas_playlist_song_operation_sequence'
 const SONG_OPERATION_DEVICE_KEY = 'ceru_nas_playlist_song_operation_device'
+const SONG_OPERATION_OCCURRED_AT_KEY = 'ceru_nas_playlist_song_operation_occurred_at'
 
 type PendingPlaylistSongOperation = {
   operationId: string
   deviceId: string
   sequence: number
+  occurredAtMs: number
   playlistId: string
   action: 'add' | 'remove'
   trackKey: string
@@ -90,19 +92,36 @@ const nextSongOperationSequence = () => {
   return next
 }
 
+const nextSongOperationOccurredAt = () => {
+  const current = Number(localStorage.getItem(SONG_OPERATION_OCCURRED_AT_KEY) || '0')
+  const next = Math.max(Date.now(), Number.isSafeInteger(current) ? current + 1 : 0)
+  localStorage.setItem(SONG_OPERATION_OCCURRED_AT_KEY, String(next))
+  return next
+}
+
 const readPendingPlaylistSongOperations = (): PendingPlaylistSongOperation[] => {
   try {
     const parsed = JSON.parse(localStorage.getItem(SONG_OPERATION_QUEUE_KEY) || '[]')
-    return Array.isArray(parsed)
-      ? parsed.filter(
-          (item) =>
-            item?.operationId &&
-            item?.deviceId &&
-            item?.playlistId &&
-            (item?.action === 'add' || item?.action === 'remove') &&
-            item?.trackKey
-        )
-      : []
+    if (!Array.isArray(parsed)) return []
+    return parsed.flatMap((item) => {
+      if (
+        !item?.operationId ||
+        !item?.deviceId ||
+        !item?.playlistId ||
+        (item?.action !== 'add' && item?.action !== 'remove') ||
+        !item?.trackKey
+      ) {
+        return []
+      }
+      const parsedCreatedAt = Date.parse(String(item?.createdAt || ''))
+      const occurredAtMs =
+        Number.isSafeInteger(item?.occurredAtMs) && item?.occurredAtMs > 0
+          ? item.occurredAtMs
+          : Number.isFinite(parsedCreatedAt) && parsedCreatedAt > 0
+            ? parsedCreatedAt
+            : Date.now()
+      return [{...item, occurredAtMs} as PendingPlaylistSongOperation]
+    })
   } catch {
     return []
   }
@@ -128,7 +147,12 @@ export const flushPendingFavoriteSongOperations = async () => {
   flushSongOperationsPromise = (async () => {
     if (!(await canUseNasSync())) return
     while (true) {
-      const pending = readPendingPlaylistSongOperations()
+      const pending = readPendingPlaylistSongOperations().sort(
+        (left, right) =>
+          left.occurredAtMs - right.occurredAtMs ||
+          left.sequence - right.sequence ||
+          left.operationId.localeCompare(right.operationId)
+      )
       if (pending.length === 0) break
       let acknowledged = false
       let failed = false
@@ -175,6 +199,7 @@ const enqueueFavoriteSongOperations = async (
           : `song-op-${Date.now()}-${index}-${Math.random().toString(16).slice(2)}`,
       deviceId,
       sequence: nextSongOperationSequence(),
+      occurredAtMs: nextSongOperationOccurredAt(),
       playlistId: cloudId,
       action,
       trackKey,
@@ -437,6 +462,9 @@ export const syncPlaylistSongsSnapshotToCloud = async (
   if (isBridgedPlaylist(playlist, songs)) return null
 
   try {
+    if (isFavoritesSongList(playlist)) {
+      await flushPendingFavoriteSongOperations()
+    }
     const cloudId = await ensureCloudPlaylistForLocal(playlist)
     if (!cloudId) return null
     const syncAPI = await getSongListSyncAPI()
@@ -449,7 +477,8 @@ export const syncPlaylistSongsSnapshotToCloud = async (
         playlist.coverImgUrl && playlist.coverImgUrl !== 'default-cover'
           ? playlist.coverImgUrl
           : undefined,
-      songlist: mapSongsToCloud(songs, true)
+      songlist: mapSongsToCloud(songs, true),
+      orderOnly: isFavoritesSongList(playlist)
     })
     await markPlaylistCloudSyncOk(playlist, cloudId, res.updatedAt)
     return res
