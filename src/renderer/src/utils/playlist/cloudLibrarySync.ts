@@ -413,15 +413,20 @@ export const syncAddSongsToCloud = async (playlist: SongList, songs: readonly So
 
 export const syncRemoveSongsFromCloud = async (
   playlist: SongList,
-  songmids: readonly (string | number)[]
+  songmids: readonly (string | number)[],
+  songs: readonly Songs[] = []
 ) => {
   if (!(await canUseCloudLibrary())) return null
   if (songmids.length === 0) return null
 
   try {
     if (await canUseNasSync() && isFavoritesSongList(playlist)) {
-      const localSongsRes = await songListAPI.getSongs(playlist.id)
-      const localSongs = localSongsRes.success && Array.isArray(localSongsRes.data) ? localSongsRes.data : []
+      const localSongsRes = songs.length === 0 ? await songListAPI.getSongs(playlist.id) : null
+      const localSongs = songs.length > 0
+        ? [...songs]
+        : localSongsRes?.success && Array.isArray(localSongsRes.data)
+          ? localSongsRes.data
+          : []
       const requestedIds = new Set(songmids.map((id) => String(id)))
       const matchedSongs = localSongs.filter((song) => requestedIds.has(String(song.songmid)))
       const trackKeys = songmids.map((songmid) => {
@@ -524,6 +529,7 @@ export const syncDeletePlaylistFromCloud = async (playlist: SongList) => {
 
 export const pullFavoritesFromCloud = async () => {
   if (!(await canUseCloudLibrary())) return null
+  await flushPendingFavoriteSongOperations()
 
   const { localId, cloudId, playlist } = await ensureFavoritesCloudBinding()
   if (!cloudId) return null

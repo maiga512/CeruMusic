@@ -987,7 +987,8 @@ const handleRemoveFromLocalPlaylist = async (song: MusicItem) => {
           source: 'local',
           meta: playlistInfo.value.meta
         } as SongList,
-        [song.songmid]
+        [song.songmid],
+        [song]
       ).catch((error: any) => {
         console.error('同步云端删除失败:', error)
         MessagePlugin.warning('本地已移除，云端同步稍后重试')
@@ -1192,7 +1193,8 @@ const handleRemoveBatchSelected = async (batchSongs: any[]) => {
             source: 'local',
             meta: playlistInfo.value.meta
           } as SongList,
-          mids
+          mids,
+          batchSongs
         ).catch((error: any) => {
           console.error('同步云端批量删除失败:', error)
           MessagePlugin.warning('本地已移除，云端同步稍后重试')

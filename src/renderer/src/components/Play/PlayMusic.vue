@@ -735,13 +735,17 @@ const onToggleLike = async () => {
       )
       if (removeRes.success && removeRes.data) {
         likeState.value = false
+        try {
+          await syncRemoveSongsFromCloud(
+            favoritesPlaylist as any,
+            [userInfo.value.lastPlaySongId as any],
+            [_.cloneDeep(toRaw(currentSong)) as any]
+          )
+        } catch (error) {
+          console.error('同步取消喜欢到云端失败:', error)
+          MessagePlugin.warning('本地已取消喜欢，云端同步稍后重试')
+        }
         window.dispatchEvent(new Event('playlist-updated'))
-        syncRemoveSongsFromCloud(favoritesPlaylist as any, [userInfo.value.lastPlaySongId as any]).catch(
-          (error) => {
-            console.error('同步取消喜欢到云端失败:', error)
-            MessagePlugin.warning('本地已取消喜欢，云端同步稍后重试')
-          }
-        )
         // MessagePlugin.success('已取消喜欢')
       } else {
         MessagePlugin.error(removeRes.error || '取消喜欢失败')
@@ -752,13 +756,13 @@ const onToggleLike = async () => {
       ])
       if (addRes.success) {
         likeState.value = true
+        try {
+          await syncAddSongsToCloud(favoritesPlaylist as any, [_.cloneDeep(toRaw(currentSong)) as any])
+        } catch (error) {
+          console.error('同步喜欢到云端失败:', error)
+          MessagePlugin.warning('本地已添加喜欢，云端同步稍后重试')
+        }
         window.dispatchEvent(new Event('playlist-updated'))
-        syncAddSongsToCloud(favoritesPlaylist as any, [_.cloneDeep(toRaw(currentSong)) as any]).catch(
-          (error) => {
-            console.error('同步喜欢到云端失败:', error)
-            MessagePlugin.warning('本地已添加喜欢，云端同步稍后重试')
-          }
-        )
         // MessagePlugin.success('已添加到“我的喜欢”')
       } else {
         MessagePlugin.error(addRes.error || '添加到“我的喜欢”失败')
