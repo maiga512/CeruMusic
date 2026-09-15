@@ -183,3 +183,145 @@ test('order-only snapshots can reorder favorites but cannot change membership', 
     );
   });
 });
+
+
+test('plugin operations union music-source scripts by identity and ignore stale later', () => {
+  withDatabase((database, userId) => {
+    const first = database.putPluginBlob('// @name Demo\n// @author A\nmodule.exports = {name:"Demo"}');
+    const second = database.putPluginBlob('// @name Demo\n// @author A\nmodule.exports = {name:"Demo2"}');
+    const added = database.applyPluginOperation(userId, {
+      operationId: 'plugin-add-1',
+      deviceId: 'phone',
+      sequence: 1,
+      occurredAtMs: 1_000,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'A',
+      version: '1.0.0',
+      enabled: true,
+      contentHash: first.contentHash,
+    });
+    assert.equal(added?.applied, true);
+    const stale = database.applyPluginOperation(userId, {
+      operationId: 'plugin-add-stale',
+      deviceId: 'desktop',
+      sequence: 1,
+      occurredAtMs: 500,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'A',
+      version: '0.9.0',
+      enabled: false,
+      contentHash: second.contentHash,
+    });
+    assert.equal(stale?.stale, true);
+    const items = database.listPlugins(userId);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].contentHash, first.contentHash);
+    assert.equal(items[0].enabled, true);
+  });
+});
+
+test('capability upsert merges secrets and never stores plaintext in sqlite', () => {
+  withDatabase((database, userId) => {
+    database.applyPluginOperation(userId, {
+      operationId: 'cap-1',
+      deviceId: 'desktop',
+      sequence: 1,
+      occurredAtMs: 1_000,
+      kind: 'capability',
+      action: 'upsert',
+      role: 'feiniu',
+      config: {
+        host: 'Fn.example.com',
+        port: 11443,
+        useHttps: true,
+        username: 'song',
+        password: 'secret-pass',
+        accessCode: '1234',
+      },
+    });
+    database.applyPluginOperation(userId, {
+      operationId: 'cap-2',
+      deviceId: 'phone',
+      sequence: 1,
+      occurredAtMs: 2_000,
+      kind: 'capability',
+      action: 'upsert',
+      role: 'feiniu',
+      config: {
+        host: 'fn.example.com',
+        port: 11443,
+        useHttps: true,
+        username: 'song',
+        password: '',
+        accessCode: '',
+      },
+    });
+    const items = database.listPlugins(userId);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].identityKey, 'capability:feiniu');
+    assert.equal(items[0].config?.password, 'secret-pass');
+    assert.equal(items[0].config?.accessCode, '1234');
+    const events = database.getSyncEvents(userId, 0).events.filter((event) => event.entityType === 'plugin');
+    assert.ok(events.length >= 1);
+    const payload = JSON.stringify(events.at(-1)?.payload || {});
+    assert.equal(payload.includes('secret-pass'), true);
+  });
+});
+
+test('identical playlist metadata patches do not advance revision or emit events', () => {
+  withDatabase((database, userId, playlistId) => {
+    const before = database.getCurrentRevision(userId);
+    const updated = database.updatePlaylist(userId, {
+      playlistId,
+      title: '我的喜欢',
+      semanticType: 'favorites',
+    });
+
+    assert.equal(updated?.revision, before);
+    assert.equal(database.getCurrentRevision(userId), before);
+    assert.equal(database.getSyncEvents(userId, before).events.length, 0);
+  });
+});
+
+test('identical plugin upserts do not advance revision or emit events', () => {
+  withDatabase((database, userId) => {
+    const blob = database.putPluginBlob('// @name Demo\n// @author A\nmodule.exports = {name:"Demo"}');
+    const first = database.applyPluginOperation(userId, {
+      operationId: 'plugin-first',
+      deviceId: 'phone',
+      sequence: 1,
+      occurredAtMs: 1_000,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'A',
+      version: '1.0.0',
+      enabled: true,
+      contentHash: blob.contentHash,
+    });
+    const revisionAfterFirst = database.getCurrentRevision(userId);
+    assert.equal(first?.changed, true);
+
+    const duplicate = database.applyPluginOperation(userId, {
+      operationId: 'plugin-duplicate',
+      deviceId: 'phone',
+      sequence: 2,
+      occurredAtMs: 2_000,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'A',
+      version: '1.0.0',
+      enabled: true,
+      contentHash: blob.contentHash,
+    });
+
+    assert.equal(duplicate?.changed, false);
+    assert.equal(database.getCurrentRevision(userId), revisionAfterFirst);
+    assert.equal(database.getSyncEvents(userId, revisionAfterFirst).events.length, 0);
+  });
+});

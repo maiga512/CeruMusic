@@ -4,6 +4,7 @@ import {URL} from 'node:url';
 import {renderAdminPage} from './adminPage.ts';
 import {createToken, hashPassword, verifyPassword} from './crypto.ts';
 import {SyncDatabase} from './database.ts';
+import {MAX_PLUGIN_SCRIPT_BYTES} from './pluginIdentity.ts';
 import type {AuthUser, RequestContext, UnknownRecord} from './types.ts';
 
 const DEFAULT_SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
@@ -35,6 +36,11 @@ const readBody = async (request: IncomingMessage): Promise<UnknownRecord> => {
 
   if (!chunks.length) return {};
   const buffer = Buffer.concat(chunks);
+  if (buffer.byteLength > MAX_PLUGIN_SCRIPT_BYTES + 64 * 1024) {
+    const error = new Error('请求体过大');
+    Object.assign(error, {statusCode: 413});
+    throw error;
+  }
   const contentType = String(request.headers['content-type'] || '').toLowerCase();
 
   if (contentType.includes('application/json')) {
@@ -512,12 +518,29 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
         playlistId: getString(body.playlistId || url.searchParams.get('playlistId')),
       }),
   },
+  '/plugins': {
+    GET: ({auth}) => ({items: database.listPlugins(requireAuth(auth).user.id)}),
+  },
+  '/plugin-blobs': {
+    POST: ({auth, body}) => {
+      requireAuth(auth);
+      const script = typeof body.script === 'string' ? body.script : '';
+      return database.putPluginBlob(script);
+    },
+  },
+  '/plugin-ops': {
+    POST: ({auth, body}) => database.applyPluginOperation(requireAuth(auth).user.id, body),
+  },
+  '/plugin-operations': {
+    POST: ({auth, body}) => database.applyPluginOperation(requireAuth(auth).user.id, body),
+  },
 });
 
 type DynamicRoute =
   | {type: 'playlist'; id: string}
   | {type: 'playlistSongs'; playlistId: string; songId?: string}
-  | {type: 'favoriteDelete'; entityType: string; entityId: string};
+  | {type: 'favoriteDelete'; entityType: string; entityId: string}
+  | {type: 'pluginBlob'; hash: string};
 
 const findDynamicRoute = (pathname: string): DynamicRoute | null => {
   const playlistPatch = pathname.match(/^\/playlists\/([^/]+)$/);
@@ -536,6 +559,9 @@ const findDynamicRoute = (pathname: string): DynamicRoute | null => {
   if (favoriteDelete?.[1] && favoriteDelete[2]) {
     return {type: 'favoriteDelete', entityType: decodeURIComponent(favoriteDelete[1]), entityId: decodeURIComponent(favoriteDelete[2])};
   }
+
+  const pluginBlob = pathname.match(/^\/plugin-blobs\/([^/]+)$/);
+  if (pluginBlob?.[1]) return {type: 'pluginBlob', hash: decodeURIComponent(pluginBlob[1])};
 
   return null;
 };
@@ -561,6 +587,16 @@ const handleDynamicRoute = (database: SyncDatabase, dynamic: DynamicRoute | null
 
   if (dynamic.type === 'favoriteDelete' && method === 'DELETE') {
     return database.deleteFavorite(session.user.id, {entityType: dynamic.entityType, entityId: dynamic.entityId});
+  }
+
+  if (dynamic.type === 'pluginBlob' && method === 'GET') {
+    const blob = database.getPluginBlob(dynamic.hash);
+    if (!blob) {
+      const error = new Error('插件脚本不存在');
+      Object.assign(error, {statusCode: 404});
+      throw error;
+    }
+    return blob;
   }
 
   return undefined;

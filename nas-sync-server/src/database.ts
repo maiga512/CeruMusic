@@ -3,8 +3,16 @@ import {dirname} from 'node:path';
 
 import Database from 'better-sqlite3';
 
-import {createId, createPairCode, hashToken, nowIso} from './crypto.ts';
+import {createId, createPairCode, decryptJson, encryptJson, generateDataKey, hashToken, nowIso, sha256Hex} from './crypto.ts';
 import {encodeSongForLegacyClient, getText, normalizeFavoriteEntityType, normalizeSong, parseJsonArray} from './normalize.ts';
+import {
+  MAX_PLUGIN_SCRIPT_BYTES,
+  canonicalizeCapabilityConfig,
+  capabilityIdentityKey,
+  canonicalCapabilityRole,
+  mergeCapabilityConfig,
+  musicSourceIdentityKey,
+} from './pluginIdentity.ts';
 import type {
   AuthUser,
   FavoriteInput,
@@ -12,12 +20,19 @@ import type {
   PlaylistPatchInput,
   PlaylistSongMutationInput,
   PlaylistSongOperationInput,
+  PluginKind,
+  PluginOperationInput,
+  SyncedPlugin,
   RequestContext,
   SyncEvent,
   UnknownRecord,
 } from './types.ts';
 
 const json = (value: unknown) => JSON.stringify(value ?? null);
+const CAPABILITY_SECRET_SETTING = 'capability.secretKey';
+const parseJsonRecord = (value: unknown) => parseJson<UnknownRecord>(value, {});
+const parseStringArray = (value: unknown) =>
+  Array.isArray(value) ? value.map((item) => String(item || '').trim()).filter(Boolean) : [];
 const FAVORITES_SEMANTIC = 'favorites';
 const FAVORITES_TITLE = '我的喜欢';
 const FAVORITES_STABLE_LOCAL_ID = 'system:favorites';
@@ -166,6 +181,41 @@ type SyncEventRow = {
   action: string;
   payload_json: string;
   deleted_at: string | null;
+  created_at: string;
+};
+
+type UserPluginRow = {
+  id: string;
+  user_id: string;
+  kind: PluginKind;
+  identity_key: string;
+  name: string | null;
+  author: string | null;
+  version: string | null;
+  enabled: number;
+  disabled_sources_json: string;
+  content_hash: string | null;
+  config_cipher: string | null;
+  revision: number;
+  deleted_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type PluginOperationRow = {
+  operation_id: string;
+  user_id: string;
+  device_id: string;
+  sequence: number;
+  occurred_at_ms: number;
+  identity_key: string;
+  action: string;
+  kind: string;
+  applied: number;
+  changed: number;
+  stale: number;
+  result_json: string;
+  revision: number;
   created_at: string;
 };
 
@@ -635,24 +685,29 @@ export class SyncDatabase {
       const deleted = this.deletePlaylist(userId, playlistId);
       return deleted ? {...deleted, skipped: true, reason: 'bridged-playlist-excluded'} : null;
     }
+    if (preview) {
+      const previewNext = this.buildPlaylistUpdate(preview, input, preview.revision, preview.updated_at);
+      const snapshotSongs = parseJsonArray(input.songlist || input.songs);
+      const shouldReplaceSongs =
+        Boolean(input.songlist || input.songs) &&
+        this.canReplaceFavoriteSongsFromSnapshot(userId, preview, snapshotSongs, input.orderOnly === true);
+      const unchanged =
+        this.playlistMetadataEquals(preview, previewNext) &&
+        (!shouldReplaceSongs || this.isSamePlaylistSongSnapshot(userId, playlistId, snapshotSongs));
+      if (unchanged) {
+        return {
+          ...toPlaylist(preview, this.countSongs(userId, playlistId)),
+          revision: preview.revision,
+          updatedAt: preview.updated_at,
+        };
+      }
+    }
 
     return this.writeTransaction(userId, (revision, at) => {
       const existing = this.getPlaylistRow(userId, playlistId);
       if (!existing) return null;
 
-      const next = {
-        ...existing,
-        local_id: getText(input.localId) || existing.local_id,
-        title: getText(input.title) || getText(input.name) || existing.title,
-        description: getText(input.description) || getText(input.describe) || existing.description,
-        cover_url: getText(input.coverUrl) || getText(input.cover) || getText(input.filePath) || existing.cover_url,
-        semantic_type: getText(input.semanticType) || existing.semantic_type,
-        source: getText(input.source) || existing.source,
-        source_playlist_id: getText(input.sourcePlaylistId) || existing.source_playlist_id,
-        revision,
-        deleted_at: null,
-        updated_at: at,
-      };
+      const next = this.buildPlaylistUpdate(existing, input, revision, at);
 
       this.db
         .prepare(
@@ -682,6 +737,69 @@ export class SyncDatabase {
       const total = this.countSongs(userId, playlistId);
       this.recordEvent(userId, revision, 'playlist', playlistId, 'upsert', toPlaylist(next, total), null, at);
       return {...toPlaylist(next, total), revision, updatedAt: at};
+    });
+  }
+
+  private buildPlaylistUpdate(
+    existing: PlaylistRow,
+    input: PlaylistPatchInput,
+    revision: number,
+    at: string,
+  ): PlaylistRow {
+    return {
+      ...existing,
+      local_id: getText(input.localId) || existing.local_id,
+      title: getText(input.title) || getText(input.name) || existing.title,
+      description: getText(input.description) || getText(input.describe) || existing.description,
+      cover_url: getText(input.coverUrl) || getText(input.cover) || getText(input.filePath) || existing.cover_url,
+      semantic_type: getText(input.semanticType) || existing.semantic_type,
+      source: getText(input.source) || existing.source,
+      source_playlist_id: getText(input.sourcePlaylistId) || existing.source_playlist_id,
+      revision,
+      deleted_at: null,
+      updated_at: at,
+    };
+  }
+
+  private playlistMetadataEquals(left: PlaylistRow, right: PlaylistRow) {
+    return (
+      left.local_id === right.local_id &&
+      left.title === right.title &&
+      left.description === right.description &&
+      left.cover_url === right.cover_url &&
+      left.semantic_type === right.semantic_type &&
+      left.source === right.source &&
+      left.source_playlist_id === right.source_playlist_id
+    );
+  }
+
+  private isSamePlaylistSongSnapshot(userId: string, playlistId: string, songs: UnknownRecord[]) {
+    const normalized = this.normalizePlaylistSnapshot(songs);
+    const currentRows = this.db
+      .prepare(
+        `SELECT *
+         FROM playlist_songs
+         WHERE user_id = ? AND playlist_id = ? AND deleted_at IS NULL
+         ORDER BY sort_order ASC, created_at ASC, id ASC`,
+      )
+      .all(userId, playlistId) as PlaylistSongRow[];
+    if (normalized.length !== currentRows.length) return false;
+
+    return normalized.every((song, index) => {
+      const row = currentRows[index];
+      if (!row || row.track_key !== song.trackKey) return false;
+      const stored = parseJsonRecord(row.track_json);
+      return (
+        stored.id === song.id &&
+        stored.source === song.source &&
+        stored.title === song.title &&
+        stored.artist === song.artist &&
+        stored.album === song.album &&
+        stored.albumId === song.albumId &&
+        stored.durationText === song.durationText &&
+        stored.artworkUrl === song.artworkUrl &&
+        json(stored.qualities ?? null) === json(song.qualities ?? null)
+      );
     });
   }
 
@@ -819,7 +937,7 @@ export class SyncDatabase {
       throw error;
     }
 
-    return this.db.transaction(() => {
+    const result = this.db.transaction(() => {
       const existingOperation = this.db
         .prepare(
           `SELECT * FROM playlist_song_operations
@@ -1118,6 +1236,8 @@ export class SyncDatabase {
         false,
       );
     })();
+    this.notifySyncWaiters(userId);
+    return result;
   }
 
   listFavorites(userId: string, entityType?: string) {
@@ -1218,6 +1338,429 @@ export class SyncDatabase {
       this.recordEvent(userId, revision, 'favorite', row.id, 'delete', {...toFavorite(row), deletedAt: at}, at, at);
       return {id: row.id, playlistId: entityType === 'playlist' ? entityId : undefined, entityId, revision, deletedAt: at, updatedAt: at};
     });
+  }
+
+  getCapabilitySecretKey() {
+    const existing = this.getSetting(CAPABILITY_SECRET_SETTING);
+    if (existing) return existing;
+    const generated = generateDataKey();
+    this.setSetting(CAPABILITY_SECRET_SETTING, generated);
+    return generated;
+  }
+
+  putPluginBlob(script: string) {
+    const value = String(script || '');
+    const byteSize = Buffer.byteLength(value, 'utf8');
+    if (!value.trim()) {
+      const error = new Error('plugin script 不能为空');
+      Object.assign(error, {statusCode: 400});
+      throw error;
+    }
+    if (byteSize > MAX_PLUGIN_SCRIPT_BYTES) {
+      const error = new Error('插件脚本不能超过 2MB');
+      Object.assign(error, {statusCode: 400});
+      throw error;
+    }
+    const contentHash = sha256Hex(value);
+    this.db
+      .prepare(
+        `INSERT INTO plugin_blobs (content_hash, script, byte_size, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(content_hash) DO NOTHING`,
+      )
+      .run(contentHash, value, byteSize, nowIso());
+    return {contentHash, byteSize};
+  }
+
+  getPluginBlob(contentHash: string) {
+    const hash = getText(contentHash);
+    if (!hash) return null;
+    const row = this.db
+      .prepare(`SELECT content_hash, script, byte_size FROM plugin_blobs WHERE content_hash = ?`)
+      .get(hash) as {content_hash: string; script: string; byte_size: number} | undefined;
+    if (!row) return null;
+    return {contentHash: row.content_hash, script: row.script, byteSize: Number(row.byte_size || 0)};
+  }
+
+  listPlugins(userId: string, options: {includeDeleted?: boolean} = {}) {
+    const rows = this.db
+      .prepare(
+        options.includeDeleted
+          ? `SELECT * FROM user_plugins WHERE user_id = ? ORDER BY updated_at ASC`
+          : `SELECT * FROM user_plugins WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at ASC`,
+      )
+      .all(userId) as UserPluginRow[];
+    return rows.map((row) => this.toSyncedPlugin(row));
+  }
+
+  applyPluginOperation(userId: string, input: PluginOperationInput) {
+    const operationId = getText(input.operationId);
+    const deviceId = getText(input.deviceId);
+    const sequence = Number(input.sequence);
+    const action = input.action === 'remove' ? 'remove' : input.action === 'upsert' ? 'upsert' : null;
+    if (!operationId || !deviceId || !action || !Number.isSafeInteger(sequence) || sequence < 1) {
+      const error = new Error('operationId、deviceId、sequence、action 必须有效');
+      Object.assign(error, {statusCode: 400});
+      throw error;
+    }
+
+    const requestedOccurredAtMs = Number(input.occurredAtMs);
+    const occurredAtMs = Number.isSafeInteger(requestedOccurredAtMs) && requestedOccurredAtMs > 0
+      ? requestedOccurredAtMs
+      : Date.now();
+
+    const kind: PluginKind = input.kind === 'capability' ? 'capability' : 'music-source';
+    const role = kind === 'capability' ? canonicalCapabilityRole(input.role || input.identityKey?.replace(/^capability:/, '')) : '';
+    const identityKey = kind === 'capability'
+      ? capabilityIdentityKey(role)
+      : getText(input.identityKey) || musicSourceIdentityKey(input.name, input.author);
+    if (!identityKey || (kind === 'capability' && !role)) {
+      const error = new Error(kind === 'capability' ? 'capability role 必须有效' : 'identityKey 不能为空');
+      Object.assign(error, {statusCode: 400});
+      throw error;
+    }
+    if (kind === 'music-source' && action === 'upsert' && !getText(input.contentHash)) {
+      const error = new Error('music-source 插件必须提供 contentHash');
+      Object.assign(error, {statusCode: 400});
+      throw error;
+    }
+    if (kind === 'music-source' && action === 'upsert') {
+      const blob = this.getPluginBlob(String(input.contentHash || ''));
+      if (!blob) {
+        const error = new Error('请先上传插件脚本');
+        Object.assign(error, {statusCode: 400});
+        throw error;
+      }
+    }
+
+    const result = this.db.transaction(() => {
+      const existingOperation = this.db
+        .prepare(`SELECT * FROM plugin_operations WHERE user_id = ? AND operation_id = ?`)
+        .get(userId, operationId) as PluginOperationRow | undefined;
+      if (existingOperation) {
+        return parseJson<UnknownRecord>(existingOperation.result_json, {
+          operationId,
+          applied: Boolean(existingOperation.applied),
+          changed: Boolean(existingOperation.changed),
+          stale: Boolean(existingOperation.stale),
+          action: existingOperation.action,
+          identityKey: existingOperation.identity_key,
+          revision: existingOperation.revision,
+          updatedAt: existingOperation.created_at,
+        });
+      }
+
+      const at = nowIso();
+      const persistResult = (
+        result: Record<string, unknown>,
+        revision: number,
+        applied: boolean,
+        changed: boolean,
+        stale: boolean,
+      ) => {
+        this.db
+          .prepare(
+            `INSERT INTO plugin_operations
+             (operation_id, user_id, device_id, sequence, occurred_at_ms, identity_key, action, kind,
+              applied, changed, stale, result_json, revision, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            operationId,
+            userId,
+            deviceId,
+            sequence,
+            occurredAtMs,
+            identityKey,
+            action,
+            kind,
+            applied ? 1 : 0,
+            changed ? 1 : 0,
+            stale ? 1 : 0,
+            json(result),
+            revision,
+            at,
+          );
+        return result;
+      };
+
+      const currentRevision = this.getCurrentRevision(userId);
+      const newerOperation = this.db
+        .prepare(
+          `SELECT operation_id
+           FROM plugin_operations
+           WHERE user_id = ? AND device_id = ? AND identity_key = ? AND sequence > ?
+           LIMIT 1`,
+        )
+        .get(userId, deviceId, identityKey, sequence) as {operation_id: string} | undefined;
+      if (newerOperation) {
+        return persistResult(
+          {
+            operationId,
+            applied: false,
+            changed: false,
+            stale: true,
+            action,
+            identityKey,
+            revision: currentRevision,
+            updatedAt: at,
+          },
+          currentRevision,
+          false,
+          false,
+          true,
+        );
+      }
+
+      const latest = this.db
+        .prepare(
+          `SELECT operation_id, device_id, sequence, occurred_at_ms
+           FROM plugin_operations
+           WHERE user_id = ? AND identity_key = ?
+           ORDER BY occurred_at_ms DESC, operation_id DESC
+           LIMIT 1`,
+        )
+        .get(userId, identityKey) as
+          | {operation_id: string; device_id: string; sequence: number; occurred_at_ms: number}
+          | undefined;
+      const latestSameDevice = latest?.device_id === deviceId;
+      if (
+        latest &&
+        (
+          (latestSameDevice
+            ? sequence <= Number(latest.sequence || 0)
+            : occurredAtMs < Number(latest.occurred_at_ms || 0) ||
+              (occurredAtMs === Number(latest.occurred_at_ms || 0) && operationId <= latest.operation_id))
+        )
+      ) {
+        return persistResult(
+          {
+            operationId,
+            applied: false,
+            changed: false,
+            stale: true,
+            action,
+            identityKey,
+            revision: currentRevision,
+            updatedAt: at,
+            winningOperationId: latest.operation_id,
+            winningOccurredAtMs: Number(latest.occurred_at_ms || 0),
+          },
+          currentRevision,
+          false,
+          false,
+          true,
+        );
+      }
+
+      const existing = this.db
+        .prepare(`SELECT * FROM user_plugins WHERE user_id = ? AND identity_key = ?`)
+        .get(userId, identityKey) as UserPluginRow | undefined;
+
+      if (action === 'remove') {
+        const revision = this.nextRevision(userId);
+        if (!existing || existing.deleted_at) {
+          const result = {
+            operationId,
+            applied: false,
+            changed: false,
+            stale: false,
+            action,
+            identityKey,
+            revision,
+            updatedAt: at,
+          };
+          persistResult(result, revision, false, false, false);
+          return result;
+        }
+        this.db
+          .prepare(`UPDATE user_plugins SET revision = ?, deleted_at = ?, updated_at = ? WHERE user_id = ? AND id = ?`)
+          .run(revision, at, at, userId, existing.id);
+        const payload = this.toSyncedPlugin({...existing, revision, deleted_at: at, updated_at: at});
+        this.recordEvent(userId, revision, 'plugin', identityKey, 'delete', payload, at, at);
+        const result = {
+          operationId,
+          applied: true,
+          changed: true,
+          stale: false,
+          action,
+          identityKey,
+          plugin: payload,
+          revision,
+          updatedAt: at,
+        };
+        persistResult(result, revision, true, true, false);
+        return result;
+      }
+
+      const next = this.buildUserPluginRow(userId, existing, {
+        kind,
+        identityKey,
+        role,
+        name: getText(input.name) || (kind === 'capability' ? role : '') || '',
+        author: getText(input.author) || '',
+        version: getText(input.version) || '',
+        enabled: input.enabled !== false,
+        disabledSources: parseStringArray(input.disabledSources),
+        contentHash: kind === 'music-source' ? (getText(input.contentHash) || '') : '',
+        config: kind === 'capability' ? mergeCapabilityConfig(role, this.decryptPluginConfig(existing), input.config) : {},
+        revision: currentRevision,
+        at,
+      });
+
+      if (existing && !existing.deleted_at && this.userPluginContentEquals(existing, next)) {
+        const result = {
+          operationId,
+          applied: true,
+          changed: false,
+          stale: false,
+          action,
+          identityKey,
+          plugin: this.toSyncedPlugin(existing),
+          revision: currentRevision,
+          updatedAt: existing.updated_at,
+        };
+        persistResult(result, currentRevision, true, false, false);
+        return result;
+      }
+
+      const revision = this.nextRevision(userId);
+      const persisted = {...next, revision, updated_at: at};
+      this.db
+        .prepare(
+          `INSERT INTO user_plugins
+           (id, user_id, kind, identity_key, name, author, version, enabled, disabled_sources_json,
+            content_hash, config_cipher, revision, deleted_at, created_at, updated_at)
+           VALUES (@id, @user_id, @kind, @identity_key, @name, @author, @version, @enabled, @disabled_sources_json,
+            @content_hash, @config_cipher, @revision, @deleted_at, @created_at, @updated_at)
+           ON CONFLICT(user_id, identity_key) DO UPDATE SET
+             kind = excluded.kind,
+             name = excluded.name,
+             author = excluded.author,
+             version = excluded.version,
+             enabled = excluded.enabled,
+             disabled_sources_json = excluded.disabled_sources_json,
+             content_hash = excluded.content_hash,
+             config_cipher = excluded.config_cipher,
+             revision = excluded.revision,
+             deleted_at = NULL,
+             updated_at = excluded.updated_at`,
+        )
+        .run(persisted);
+      const payload = this.toSyncedPlugin(persisted);
+      this.recordEvent(userId, revision, 'plugin', identityKey, 'upsert', payload, null, at);
+      const result = {
+        operationId,
+        applied: true,
+        changed: true,
+        stale: false,
+        action,
+        identityKey,
+        plugin: payload,
+        revision,
+        updatedAt: at,
+      };
+      persistResult(result, revision, true, true, false);
+      return result;
+    })();
+    this.notifySyncWaiters(userId);
+    return result;
+  }
+
+  private decryptPluginConfig(row?: UserPluginRow | null) {
+    if (!row?.config_cipher) return {};
+    return decryptJson<UnknownRecord>(this.getCapabilitySecretKey(), row.config_cipher, {});
+  }
+
+  private userPluginContentEquals(left: UserPluginRow, right: UserPluginRow) {
+    const leftPlugin = this.toSyncedPlugin(left);
+    const rightPlugin = this.toSyncedPlugin(right);
+    const normalizeConfig = (plugin: SyncedPlugin) => (
+      plugin.kind === 'capability'
+        ? canonicalizeCapabilityConfig(plugin.role || '', plugin.config || {})
+        : {}
+    );
+    return json({
+      kind: leftPlugin.kind,
+      name: leftPlugin.name || '',
+      author: leftPlugin.author || '',
+      version: leftPlugin.version || '',
+      enabled: Boolean(leftPlugin.enabled),
+      disabledSources: [...(leftPlugin.disabledSources || [])].sort(),
+      contentHash: leftPlugin.contentHash || '',
+      role: leftPlugin.role || '',
+      config: normalizeConfig(leftPlugin),
+    }) === json({
+      kind: rightPlugin.kind,
+      name: rightPlugin.name || '',
+      author: rightPlugin.author || '',
+      version: rightPlugin.version || '',
+      enabled: Boolean(rightPlugin.enabled),
+      disabledSources: [...(rightPlugin.disabledSources || [])].sort(),
+      contentHash: rightPlugin.contentHash || '',
+      role: rightPlugin.role || '',
+      config: normalizeConfig(rightPlugin),
+    });
+  }
+
+  private buildUserPluginRow(
+    userId: string,
+    existing: UserPluginRow | undefined,
+    input: {
+      kind: PluginKind;
+      identityKey: string;
+      role: string;
+      name: string;
+      author: string;
+      version: string;
+      enabled: boolean;
+      disabledSources: string[];
+      contentHash: string;
+      config: UnknownRecord;
+      revision: number;
+      at: string;
+    },
+  ): UserPluginRow {
+    const configCipher = input.kind === 'capability'
+      ? encryptJson(this.getCapabilitySecretKey(), canonicalizeCapabilityConfig(input.role, input.config))
+      : null;
+    return {
+      id: existing?.id || createId('plg'),
+      user_id: userId,
+      kind: input.kind,
+      identity_key: input.identityKey,
+      name: input.name || existing?.name || '',
+      author: input.author || existing?.author || '',
+      version: input.version || existing?.version || '',
+      enabled: input.enabled ? 1 : 0,
+      disabled_sources_json: json(input.disabledSources),
+      content_hash: input.contentHash || null,
+      config_cipher: configCipher,
+      revision: input.revision,
+      deleted_at: null,
+      created_at: existing?.created_at || input.at,
+      updated_at: input.at,
+    };
+  }
+
+  private toSyncedPlugin(row: UserPluginRow): SyncedPlugin {
+    const role = row.kind === 'capability' ? canonicalCapabilityRole(row.identity_key.replace(/^capability:/, '')) : undefined;
+    return {
+      identityKey: row.identity_key,
+      kind: row.kind,
+      name: row.name || '',
+      author: row.author || '',
+      version: row.version || '',
+      enabled: Boolean(row.enabled),
+      disabledSources: parseStringArray(parseJson(row.disabled_sources_json, [])),
+      contentHash: row.content_hash || undefined,
+      role: role || undefined,
+      config: row.kind === 'capability' ? this.decryptPluginConfig(row) : undefined,
+      revision: row.revision,
+      deletedAt: row.deleted_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
   }
 
   getSyncEvents(userId: string, sinceRevision: number) {
@@ -1395,10 +1938,60 @@ export class SyncDatabase {
       CREATE INDEX IF NOT EXISTS idx_playlist_songs_user_revision ON playlist_songs(user_id, revision);
       CREATE INDEX IF NOT EXISTS idx_favorites_user_revision ON favorites(user_id, revision);
       CREATE INDEX IF NOT EXISTS idx_sync_events_user_revision ON sync_events(user_id, revision);
-      CREATE INDEX IF NOT EXISTS idx_playlist_song_ops_order
-        ON playlist_song_operations(user_id, device_id, track_key, sequence);
-      CREATE INDEX IF NOT EXISTS idx_pair_codes_hash ON pair_codes(code_hash, expires_at, used_at);
-    `);
+CREATE INDEX IF NOT EXISTS idx_playlist_song_ops_order
+ON playlist_song_operations(user_id, device_id, track_key, sequence);
+CREATE INDEX IF NOT EXISTS idx_pair_codes_hash ON pair_codes(code_hash, expires_at, used_at);
+
+CREATE TABLE IF NOT EXISTS plugin_blobs (
+content_hash TEXT PRIMARY KEY,
+script TEXT NOT NULL,
+byte_size INTEGER NOT NULL,
+created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_plugins (
+id TEXT PRIMARY KEY,
+user_id TEXT NOT NULL,
+kind TEXT NOT NULL,
+identity_key TEXT NOT NULL,
+name TEXT,
+author TEXT,
+version TEXT,
+enabled INTEGER NOT NULL DEFAULT 1,
+disabled_sources_json TEXT NOT NULL DEFAULT '[]',
+content_hash TEXT,
+config_cipher TEXT,
+revision INTEGER NOT NULL,
+deleted_at TEXT,
+created_at TEXT NOT NULL,
+updated_at TEXT NOT NULL,
+UNIQUE(user_id, identity_key),
+FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS plugin_operations (
+operation_id TEXT NOT NULL,
+user_id TEXT NOT NULL,
+device_id TEXT NOT NULL,
+sequence INTEGER NOT NULL,
+occurred_at_ms INTEGER NOT NULL DEFAULT 0,
+identity_key TEXT NOT NULL,
+action TEXT NOT NULL,
+kind TEXT NOT NULL,
+applied INTEGER NOT NULL,
+changed INTEGER NOT NULL,
+stale INTEGER NOT NULL DEFAULT 0,
+result_json TEXT NOT NULL,
+revision INTEGER NOT NULL,
+created_at TEXT NOT NULL,
+PRIMARY KEY(user_id, operation_id),
+FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_plugins_user_revision ON user_plugins(user_id, revision);
+CREATE INDEX IF NOT EXISTS idx_plugin_ops_order
+ON plugin_operations(user_id, device_id, identity_key, sequence);
+`);
 
     this.migrateSchema();
   }
@@ -1909,13 +2502,7 @@ export class SyncDatabase {
   }
 
   private replacePlaylistSongs(userId: string, playlistId: string, songs: UnknownRecord[], revision: number, at: string) {
-    const normalized: ReturnType<typeof normalizeSong>[] = [];
-    const seenTrackKeys = new Set<string>();
-    for (const song of normalizePlaylistSongs(songs)) {
-      if (seenTrackKeys.has(song.trackKey)) continue;
-      seenTrackKeys.add(song.trackKey);
-      normalized.push(song);
-    }
+    const normalized = this.normalizePlaylistSnapshot(songs);
 
     const nextKeys = new Set(normalized.map((song) => song.trackKey));
     const currentRows = this.db
@@ -1956,6 +2543,17 @@ export class SyncDatabase {
           .prepare(`UPDATE playlist_songs SET revision = ?, deleted_at = ?, updated_at = ? WHERE user_id = ? AND id = ?`)
           .run(revision, at, at, userId, row.id);
       });
+  }
+
+  private normalizePlaylistSnapshot(songs: UnknownRecord[]) {
+    const normalized: ReturnType<typeof normalizeSong>[] = [];
+    const seenTrackKeys = new Set<string>();
+    for (const song of normalizePlaylistSongs(songs)) {
+      if (seenTrackKeys.has(song.trackKey)) continue;
+      seenTrackKeys.add(song.trackKey);
+      normalized.push(song);
+    }
+    return normalized;
   }
 
   private insertOrUpdatePlaylistSong(row: {
