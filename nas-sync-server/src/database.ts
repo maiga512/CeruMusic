@@ -1390,7 +1390,15 @@ export class SyncDatabase {
           : `SELECT * FROM user_plugins WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at ASC`,
       )
       .all(userId) as UserPluginRow[];
-    return rows.map((row) => this.toSyncedPlugin(row));
+    const plugins = rows.map((row) => this.toSyncedPlugin(row));
+    if (options.includeDeleted) return plugins;
+    const seenMusicSourceHashes = new Set<string>();
+    return plugins.filter((plugin) => {
+        if (plugin.kind !== 'music-source' || !plugin.contentHash) return true;
+        if (seenMusicSourceHashes.has(plugin.contentHash)) return false;
+        seenMusicSourceHashes.add(plugin.contentHash);
+        return true;
+      });
   }
 
   applyPluginOperation(userId: string, input: PluginOperationInput) {

@@ -357,7 +357,8 @@ test('removing one of several identical music-source scripts hides every copy', 
     });
 
     const items = database.listPlugins(userId);
-    assert.equal(items.length, 2);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].contentHash, blob.contentHash);
 
     const removed = database.applyPluginOperation(userId, {
       operationId: 'plugin-remove-a',
