@@ -375,3 +375,68 @@ test('removing one of several identical music-source scripts hides every copy', 
     assert.equal(database.listPlugins(userId, {includeDeleted: true}).length, 2);
   });
 });
+
+test('old plugin upsert cannot resurrect a later delete, but a newer re-add can', () => {
+  withDatabase((database, userId) => {
+    const blob = database.putPluginBlob('// @name Demo\n// @author A\nmodule.exports = {name:"Demo"}');
+    const added = database.applyPluginOperation(userId, {
+      operationId: 'plugin-add-before-delete',
+      deviceId: 'phone',
+      sequence: 1,
+      occurredAtMs: 1_000,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'A',
+      version: '1.0.0',
+      enabled: true,
+      contentHash: blob.contentHash,
+    });
+    assert.equal(added?.changed, true);
+    const identityKey = database.listPlugins(userId)[0]?.identityKey || '';
+    assert.notEqual(identityKey, '');
+
+    database.applyPluginOperation(userId, {
+      operationId: 'plugin-delete-after-add',
+      deviceId: 'phone',
+      sequence: 2,
+      occurredAtMs: 3_000,
+      kind: 'music-source',
+      action: 'remove',
+      identityKey,
+    });
+    assert.equal(database.listPlugins(userId).length, 0);
+
+    const staleReAdd = database.applyPluginOperation(userId, {
+      operationId: 'plugin-old-re-add',
+      deviceId: 'desktop',
+      sequence: 1,
+      occurredAtMs: 2_000,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'A',
+      version: '1.0.0',
+      enabled: true,
+      contentHash: blob.contentHash,
+    });
+    assert.equal(staleReAdd?.stale, true);
+    assert.equal(database.listPlugins(userId).length, 0);
+
+    const newerReAdd = database.applyPluginOperation(userId, {
+      operationId: 'plugin-new-re-add',
+      deviceId: 'desktop',
+      sequence: 2,
+      occurredAtMs: 4_000,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'A',
+      version: '1.0.0',
+      enabled: true,
+      contentHash: blob.contentHash,
+    });
+    assert.equal(newerReAdd?.stale, false);
+    assert.equal(database.listPlugins(userId).length, 1);
+  });
+});

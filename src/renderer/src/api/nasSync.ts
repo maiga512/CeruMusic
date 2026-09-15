@@ -199,24 +199,52 @@ const unwrapNasResponse = async <T>(response: Response): Promise<T> => {
   return body as T
 }
 
+const normalizeNasBaseUrl = (value?: string) => String(value || '').trim().replace(/\/+$/, '')
+
+const nasBaseUrlCandidates = (config: NasSyncConfig) => {
+  const urls: string[] = []
+  const push = (value?: string) => {
+    const raw = normalizeNasBaseUrl(value)
+    if (!raw) return
+    const parsed = parseNasSyncServerUrl(raw)
+    if (!parsed) return
+    const url = `${parsed.useHttps ? 'https' : 'http'}://${parsed.host}${parsed.port ? `:${parsed.port}` : ''}${parsed.path}`
+    if (!urls.includes(url)) urls.push(url)
+  }
+  push(config.serverUrl)
+  push(buildNasSyncServerUrl(config))
+  urls.sort((left, right) => {
+    const score = (url: string) => (/192\.168\.|10\.|127\.0\.0\.1|172\.(1[6-9]|2\d|3[0-1])\./.test(url) ? 1 : 0)
+    return score(right) - score(left)
+  })
+  return urls
+}
+
 const requestNas = async <T>(endpoint: string, options: RequestOptions = {}) => {
   const config = await getNasConfig()
-  const baseUrl = buildNasSyncServerUrl(config)
-  if (!baseUrl) throw new Error('请先填写 NAS 同步服务器地址')
+  const baseUrls = nasBaseUrlCandidates(config)
+  if (!baseUrls.length) throw new Error('请先填写 NAS 同步服务器地址')
 
-  const response = await fetch(`${baseUrl}${endpoint}`, {
-    method: options.method || 'GET',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      ...(options.token || config.accessToken
-        ? { Authorization: `Bearer ${options.token || config.accessToken}` }
-        : {})
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
-  })
-
-  return unwrapNasResponse<T>(response)
+  let lastError: unknown = null
+  for (const baseUrl of baseUrls) {
+    try {
+      const response = await fetch(`${baseUrl}${endpoint}`, {
+        method: options.method || 'GET',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          ...(options.token || config.accessToken
+            ? { Authorization: `Bearer ${options.token || config.accessToken}` }
+            : {})
+        },
+        body: options.body ? JSON.stringify(options.body) : undefined
+      })
+      return await unwrapNasResponse<T>(response)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError || 'NAS 同步服务请求失败'))
 }
 
 const normalizePlaylistFavoritePage = (payload: unknown): CeruFavoriteSyncPage<CeruPlaylistFavorite> => {
@@ -380,6 +408,35 @@ const normalizePodcastFavoritePage = (payload: unknown): CeruFavoriteSyncPage<Ce
 
 
 
+export type NasSyncedPlugin = {
+  identityKey: string
+  kind: 'music-source' | 'capability'
+  name: string
+  author: string
+  version: string
+  enabled: boolean
+  disabledSources: string[]
+  contentHash?: string
+  role?: string
+  config?: Record<string, unknown>
+  revision: number
+  deletedAt?: string | null
+  createdAt?: string
+  updatedAt?: string
+}
+
+export type NasPluginOperationResult = {
+  operationId: string
+  applied: boolean
+  changed: boolean
+  stale: boolean
+  action: 'upsert' | 'remove'
+  identityKey: string
+  plugin?: NasSyncedPlugin
+  revision: number
+  updatedAt: string
+}
+
 export const nasSyncAPI = {
   health: () => requestNas<{ status: string; service: string }>('/health', { token: '' }),
   me: () => requestNas<NasSyncSession['user']>('/me'),
@@ -400,6 +457,41 @@ export const nasSyncAPI = {
     song?: CloudSongDto
   }) =>
     requestNas<NasPlaylistSongOperationResult>('/playlist-song-ops', {
+      method: 'POST',
+      body: input
+    }),
+  listPlugins: async (options: { includeDeleted?: boolean } = {}) => {
+    const query = options.includeDeleted ? '?includeDeleted=true' : ''
+    const payload = await requestNas<{ items?: NasSyncedPlugin[] } | NasSyncedPlugin[]>(`/plugins${query}`)
+    return Array.isArray(payload) ? payload : payload.items || []
+  },
+  putPluginBlob: (script: string) =>
+    requestNas<{ contentHash: string; byteSize: number }>('/plugin-blobs', {
+      method: 'POST',
+      body: { script }
+    }),
+  getPluginBlob: (contentHash: string) =>
+    requestNas<{ contentHash: string; script: string; byteSize: number }>(
+      `/plugin-blobs/${encodeURIComponent(contentHash)}`
+    ),
+  applyPluginOperation: (input: {
+    operationId: string
+    deviceId: string
+    sequence: number
+    occurredAtMs: number
+    identityKey?: string
+    action: 'upsert' | 'remove'
+    kind: 'music-source' | 'capability'
+    name?: string
+    author?: string
+    version?: string
+    enabled?: boolean
+    disabledSources?: string[]
+    contentHash?: string
+    role?: string
+    config?: Record<string, unknown>
+  }) =>
+    requestNas<NasPluginOperationResult>('/plugin-ops', {
       method: 'POST',
       body: input
     })

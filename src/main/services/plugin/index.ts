@@ -11,6 +11,52 @@ import convertEventDrivenPlugin from './manager/converter-event-driven'
 import Logger, { getLog } from './logger'
 import { getPluginConfig, savePluginConfig, deletePluginConfig } from './pluginConfig'
 
+type AddPluginOptions = {
+  name?: string
+  version?: string
+  author?: string
+  forceReplace?: boolean
+}
+
+const looksLikeLxEventPlugin = (code: string) =>
+  /\blx\.on\s*\(/.test(code) ||
+  (/\bEVENT_NAMES\b/.test(code) && /\blx\.send\s*\(/.test(code)) ||
+  /\blx\.request\s*\(/.test(code)
+
+const alreadyConvertedPlugin = (code: string) =>
+  code.includes('由 CeruMusic 插件转换器转换') ||
+  (code.includes('const originalPluginCode') && code.includes('pluginInfo'))
+
+const injectPluginHeaders = (
+  code: string,
+  meta: { name: string; version: string; author: string }
+) => {
+  const hasName = /@name\s+\S+/.test(code)
+  const hasVersion = /@version\s+\S+/.test(code)
+  const hasAuthor = /@author\s+\S+/.test(code)
+  if (hasName && hasVersion && hasAuthor) return code
+  return `/**
+ * @name ${meta.name}
+ * @version ${meta.version}
+ * @author ${meta.author}
+ */
+${code}`
+}
+
+const preparePluginCodeForInstall = (
+  pluginCode: string,
+  meta: { name?: string; version?: string; author?: string }
+) => {
+  const name = String(meta.name || '').trim() || '未知插件'
+  const version = String(meta.version || '').trim() || '1.0.0'
+  const author = String(meta.author || '').trim() || 'Unknown'
+  let next = injectPluginHeaders(pluginCode, { name, version, author })
+  if (!alreadyConvertedPlugin(next) && looksLikeLxEventPlugin(next)) {
+    next = convertEventDrivenPlugin(next)
+  }
+  return next
+}
+
 // 导出类型以解决TypeScript错误
 
 // 存储已加载的插件实例
@@ -91,8 +137,18 @@ const pluginService = {
     }
   },
 
-  async addPlugin(pluginCode: string, pluginName: string, targetPluginId?: string) {
+  async addPlugin(
+    pluginCode: string,
+    pluginName: string,
+    targetPluginId?: string,
+    options?: AddPluginOptions
+  ) {
     try {
+      pluginCode = preparePluginCodeForInstall(pluginCode, {
+        name: options?.name || String(pluginName || '').replace(/\.js$/i, ''),
+        version: options?.version,
+        author: options?.author
+      })
       // 首先解析插件信息（在隔离 worker 内验证；用完立即销毁）
       const tempPluginManager = new CeruMusicPluginHost(pluginCode, new Logger('temp'))
       let pluginInfo: any
@@ -120,11 +176,17 @@ const pluginService = {
         // 检查是否已存在相同名称的插件 (作为后备方案)
         const existingPlugins = (await this.getPluginsList()) || []
         const existingPlugin = existingPlugins.find(
-          (plugin) => plugin.pluginInfo.name === pluginInfo.name
+          (plugin) =>
+            plugin.pluginInfo.name === pluginInfo.name &&
+            String(plugin.pluginInfo.author || '') === String(pluginInfo.author || '')
         )
 
         if (existingPlugin) {
-          if (existingPlugin.pluginInfo.version === pluginInfo.version) {
+          if (
+            !options?.forceReplace &&
+            !targetPluginId &&
+            existingPlugin.pluginInfo.version === pluginInfo.version
+          ) {
             throw new Error(`插件 "${pluginInfo.name} v${pluginInfo.version}" 已存在，不能重复添加`)
           }
           // 如果是更新，复用原来的 pluginId，这样前端当前使用的插件不会掉
@@ -190,6 +252,26 @@ const pluginService = {
     }
 
     return loadedPlugins[pluginId]
+  },
+
+  getPluginCode(pluginId: string): string {
+    const host = this.getPluginById(pluginId)
+    const fromHost = host?.getPluginCode()
+    if (fromHost && fromHost.trim()) return fromHost
+
+    const pluginsDir = path.join(getAppDirPath(), 'plugins')
+    if (!fs.existsSync(pluginsDir)) {
+      throw new Error(`无法读取插件源码: ${pluginId}`)
+    }
+    const pluginFile = fs.readdirSync(pluginsDir).find((file) => file.startsWith(`${pluginId}-`))
+    if (!pluginFile) {
+      throw new Error(`无法读取插件源码: ${pluginId}`)
+    }
+    const code = fs.readFileSync(path.join(pluginsDir, pluginFile), 'utf-8')
+    if (!code || !code.trim()) {
+      throw new Error(`插件源码为空: ${pluginId}`)
+    }
+    return code
   },
 
   async uninstallPlugin(pluginId: string) {

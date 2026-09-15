@@ -153,7 +153,13 @@ interface CustomAPI {
     selectAndAddPlugin: (type: 'lx' | 'cr') => Promise<any>
     downloadAndAddPlugin: (url: string, type: 'lx' | 'cr', targetPluginId?: string) => Promise<any>
     uninstallPlugin(pluginId: string): ApiResult | PromiseLike<ApiResult>
-    addPlugin: (pluginCode: string, pluginName: string, targetPluginId?: string) => Promise<any>
+    addPlugin: (
+      pluginCode: string,
+      pluginName: string,
+      targetPluginId?: string,
+      options?: { name?: string; version?: string; author?: string; forceReplace?: boolean }
+    ) => Promise<any>
+    getPluginCode: (pluginId: string) => Promise<{ code: string } | { error: string }>
     getPluginType: (pluginId: string) => Promise<any>
     getServiceRole: (pluginId: string) => Promise<any>
     getConfigSchema: (pluginId: string) => Promise<any>

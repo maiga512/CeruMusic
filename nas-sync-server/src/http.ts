@@ -519,7 +519,11 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
       }),
   },
   '/plugins': {
-    GET: ({auth}) => ({items: database.listPlugins(requireAuth(auth).user.id)}),
+    GET: ({auth, url}) => ({
+      items: database.listPlugins(requireAuth(auth).user.id, {
+        includeDeleted: url.searchParams.get('includeDeleted') === 'true',
+      }),
+    }),
   },
   '/plugin-blobs': {
     POST: ({auth, body}) => {

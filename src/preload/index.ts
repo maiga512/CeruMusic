@@ -79,8 +79,13 @@ const api = {
       ipcRenderer.invoke('service-plugin-selectAndAddPlugin', type),
     downloadAndAddPlugin: (url: string, type: 'lx' | 'cr', targetPluginId?: string) =>
       ipcRenderer.invoke('service-plugin-downloadAndAddPlugin', url, type, targetPluginId),
-    addPlugin: (pluginCode: string, pluginName: string, targetPluginId?: string) =>
-      ipcRenderer.invoke('service-plugin-addPlugin', pluginCode, pluginName, targetPluginId),
+    addPlugin: (
+      pluginCode: string,
+      pluginName: string,
+      targetPluginId?: string,
+      options?: { name?: string; version?: string; author?: string; forceReplace?: boolean }
+    ) => ipcRenderer.invoke('service-plugin-addPlugin', pluginCode, pluginName, targetPluginId, options),
+    getPluginCode: (pluginId: string) => ipcRenderer.invoke('service-plugin-getPluginCode', pluginId),
     getPluginById: (id: string) => ipcRenderer.invoke('service-plugin-getPluginById', id),
     loadAllPlugins: () => ipcRenderer.invoke('service-plugin-loadAllPlugins'),
     reloadAllPlugins: () => ipcRenderer.invoke('service-plugin-reloadAllPlugins'),

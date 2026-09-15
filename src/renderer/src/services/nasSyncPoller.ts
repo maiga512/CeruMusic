@@ -5,6 +5,7 @@ import {
   canUseNasSync,
   flushPendingPodcastFavoriteMutations,
   getNasSyncMode,
+  getNasSyncScope,
   getScopedNasSyncLastRevision,
   nasCloudSongListAPI,
   nasPlaylistAPI,
@@ -27,6 +28,14 @@ import {
   flushPendingFavoriteSongOperations,
   markPlaylistCloudSyncOk
 } from '@renderer/utils/playlist/cloudLibrarySync'
+import {
+  applyRemotePluginEvent,
+  backupLocalPluginsToCloud,
+  isPluginSyncInitialized,
+  markPluginSyncInitialized,
+  restorePluginsFromCloud,
+  unionPluginsWithCloud
+} from '@renderer/utils/playlist/pluginSync'
 import type { SongList, Songs } from '@common/types/songList'
 
 const ACTIVE_FALLBACK_INTERVAL_MS = 2_000
@@ -127,6 +136,14 @@ const summarizeNasSyncEvent = (event: NasSyncEvent) => {
     const label = isPodcast ? '播客收藏' : '收藏歌单'
     if (event.action === 'delete') {
       return `[同步事件 ${revisionText}] ${label}已取消收藏`
+    }
+    return `[同步事件 ${revisionText}] ${label}已同步`
+  }
+
+  if (event.entityType === 'plugin') {
+    const label = payload.kind === 'capability' ? `能力 ${payload.role || payload.identityKey || ''}` : `插件 ${payload.name || payload.identityKey || ''}`
+    if (event.action === 'delete') {
+      return `[同步事件 ${revisionText}] ${label}已删除`
     }
     return `[同步事件 ${revisionText}] ${label}已同步`
   }
@@ -343,6 +360,12 @@ const applyRemoteEvent = async (event: NasSyncEvent) => {
     return
   }
 
+  if (event.entityType === 'plugin') {
+    await applyRemotePluginEvent(payload, event.action === 'delete')
+    window.dispatchEvent(new Event('plugin-updated'))
+    return
+  }
+
   if (event.entityType === 'favorite' && payload.entityType === 'podcast') {
     setPodcastFavoriteFromSyncEvent(payload, event.action === 'delete')
     return
@@ -475,6 +498,7 @@ const restoreRemotePlaylistToLocal = async (remotePlaylist: any) => {
 const backupLocalLibraryToCloud = async (reason: string) => {
   await flushPendingPodcastFavoriteMutations()
   const podcastResult = await backupLocalPodcastFavoritesToCloud()
+  const pluginResult = await backupLocalPluginsToCloud(true)
   const localRes = await songListAPI.getAll()
   const playlists = localRes.success && Array.isArray(localRes.data) ? localRes.data : []
   let uploaded = 0
@@ -487,9 +511,9 @@ const backupLocalLibraryToCloud = async (reason: string) => {
   const result = await nasSyncAPI.sync(0)
   if (typeof result.revision === 'number') await setScopedNasSyncLastRevision(result.revision)
   await appendNasSyncLog(
-    `[备份到云端] ${reason}，已上传 ${uploaded} 个本地歌单、${podcastResult.uploaded} 个播客收藏`
+    `[备份到云端] ${reason}，已上传 ${uploaded} 个本地歌单、${podcastResult.uploaded} 个播客收藏、${pluginResult.uploaded} 个插件/能力`
   )
-  return { uploaded, podcastUploaded: podcastResult.uploaded, revision: result.revision }
+  return { uploaded, podcastUploaded: podcastResult.uploaded, pluginsUploaded: pluginResult.uploaded, revision: result.revision }
 }
 
 const restoreCloudLibraryToLocal = async (reason: string) => {
@@ -544,6 +568,7 @@ const restoreCloudLibraryToLocal = async (reason: string) => {
   }
 
   const podcastItems = await replaceLocalPodcastFavoritesFromCloud()
+  await restorePluginsFromCloud(true)
   const result = await nasSyncAPI.sync(0)
   if (typeof result.revision === 'number') await setScopedNasSyncLastRevision(result.revision)
   await appendNasSyncLog(
@@ -559,6 +584,7 @@ const runAutoSync = async (reason: string) => {
   await flushPendingFavoriteSongOperations()
   await flushPendingPodcastFavoriteMutations()
   await cleanupStaleBridgedCloudCopies()
+  const scope = await getNasSyncScope()
   const sinceRevision = await getScopedNasSyncLastRevision()
   const remoteSnapshot = await nasSyncAPI.sync(sinceRevision)
   if (Array.isArray(remoteSnapshot.events) && remoteSnapshot.events.length > 0) {
@@ -567,6 +593,12 @@ const runAutoSync = async (reason: string) => {
   }
   if (typeof remoteSnapshot.revision === 'number') {
     await setScopedNasSyncLastRevision(remoteSnapshot.revision)
+  }
+  if (!isPluginSyncInitialized(scope)) {
+    await unionPluginsWithCloud()
+    markPluginSyncInitialized(scope)
+  } else {
+    await backupLocalPluginsToCloud(false)
   }
   await appendNasSyncLog(`[自动同步] ${reason}，已同步服务器事件`)
   return { revision: remoteSnapshot.revision }

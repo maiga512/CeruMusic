@@ -417,7 +417,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick, toRaw, computed } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick, toRaw, computed } from 'vue'
 import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import { LocalUserDetailStore } from '@renderer/store/LocalUserDetail'
 import ImportPlaylist from '@renderer/components/ServicePlugin/ImportPlaylist.vue'
@@ -427,6 +427,8 @@ import {
   parseNasSyncServerUrl
 } from '@renderer/api/nasSync'
 import { startNasSyncPoller, stopNasSyncPoller } from '@renderer/services/nasSyncPoller'
+import { clearLocalPluginUpsert, markLocalPluginUpsert } from '@renderer/utils/playlist/pluginSync'
+import { musicSourceIdentityKey } from '@renderer/utils/playlist/pluginIdentity'
 
 interface PluginSource {
   name: string
@@ -724,6 +726,12 @@ async function handleImport() {
     } else {
       // 安装成功才刷新插件列表
       await getPlugins()
+      if (result?.pluginInfo?.name) {
+        markLocalPluginUpsert(
+          musicSourceIdentityKey(result.pluginInfo.name, result.pluginInfo.author)
+        )
+      }
+      window.dispatchEvent(new Event('ceru-nas-local-change'))
       // 显示成功消息
       if (result && result.pluginInfo) {
         MessagePlugin.success(`插件 "${result.pluginInfo.name}" 安装成功！`)
@@ -752,6 +760,11 @@ async function uninstallPlugin(pluginId: string, pluginName: string) {
       onConfirm: async () => {
         // 用户确认后，开始卸载操作
         loading.value = true
+        const targetPlugin = plugins.value.find((item) => item.pluginId === pluginId)
+        const targetIdentityKey = musicSourceIdentityKey(
+          targetPlugin?.pluginInfo?.name || pluginName,
+          targetPlugin?.pluginInfo?.author || ''
+        )
 
         const result = (await window.api.plugins.uninstallPlugin(pluginId)) as ApiResult
 
@@ -762,6 +775,7 @@ async function uninstallPlugin(pluginId: string, pluginName: string) {
           console.error('卸载插件失败:', result.error)
         } else {
           // 卸载成功才刷新插件列表
+          clearLocalPluginUpsert(targetIdentityKey)
           await getPlugins()
           // 显示成功消息
           if (pluginId === localUserStore.userInfo.pluginId) {
@@ -771,6 +785,7 @@ async function uninstallPlugin(pluginId: string, pluginName: string) {
             localUserStore.userInfo.selectSources = ''
             localUserStore.userInfo.selectQuality = ''
           }
+          window.dispatchEvent(new Event('ceru-nas-local-change'))
           MessagePlugin.success(`插件 "${pluginName}" 卸载成功！`)
         }
         dialog.destroy()
@@ -1133,6 +1148,7 @@ async function savePluginConfig() {
       savedConfigSnapshot.value = JSON.parse(JSON.stringify(plainConfig))
     }
     MessagePlugin.success('配置已保存')
+    window.dispatchEvent(new Event('ceru-nas-local-change'))
     configDialogVisible.value = false
 
     // 根据开关状态控制同步轮询
@@ -1404,13 +1420,22 @@ function toggleGroup(key: number) {
   collapsedGroups.value = next
 }
 
+const handlePluginUpdated = () => {
+  void getPlugins()
+}
+
 onMounted(async () => {
   // 确保store已初始化
   if (!localUserStore.initialization) {
     console.log('组件挂载时初始化store')
     localUserStore.init()
   }
+  window.addEventListener('plugin-updated', handlePluginUpdated)
   await getPlugins()
+})
+
+onUnmounted(() => {
+  window.removeEventListener('plugin-updated', handlePluginUpdated)
 })
 </script>
 

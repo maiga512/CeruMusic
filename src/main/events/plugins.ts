@@ -202,15 +202,24 @@ export default function InitPluginService() {
 
   ipcMain.handle(
     'service-plugin-addPlugin',
-    async (_, pluginCode, pluginName, targetPluginId): Promise<any> => {
+    async (_, pluginCode, pluginName, targetPluginId, options): Promise<any> => {
       try {
-        return await pluginService.addPlugin(pluginCode, pluginName, targetPluginId)
+        return await pluginService.addPlugin(pluginCode, pluginName, targetPluginId, options)
       } catch (error: any) {
         console.error('Error adding plugin:', error)
         return { error: error.message }
       }
     }
   )
+
+  ipcMain.handle('service-plugin-getPluginCode', async (_, pluginId): Promise<any> => {
+    try {
+      return { code: pluginService.getPluginCode(pluginId) }
+    } catch (error: any) {
+      console.error('Error getting plugin code:', error)
+      return { error: error.message }
+    }
+  })
 
   ipcMain.handle('service-plugin-getPluginById', async (_, id): Promise<any> => {
     try {
