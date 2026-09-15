@@ -325,3 +325,52 @@ test('identical plugin upserts do not advance revision or emit events', () => {
     assert.equal(database.getSyncEvents(userId, revisionAfterFirst).events.length, 0);
   });
 });
+
+test('removing one of several identical music-source scripts hides every copy', () => {
+  withDatabase((database, userId) => {
+    const blob = database.putPluginBlob('// @name Demo\n// @author A\nmodule.exports = {name:"Demo"}');
+    database.applyPluginOperation(userId, {
+      operationId: 'plugin-copy-a',
+      deviceId: 'phone',
+      sequence: 1,
+      occurredAtMs: 1_000,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'A',
+      version: '1.0.0',
+      enabled: true,
+      contentHash: blob.contentHash,
+    });
+    database.applyPluginOperation(userId, {
+      operationId: 'plugin-copy-b',
+      deviceId: 'desktop',
+      sequence: 1,
+      occurredAtMs: 2_000,
+      kind: 'music-source',
+      action: 'upsert',
+      name: 'Demo',
+      author: 'B',
+      version: '1.0.0',
+      enabled: true,
+      contentHash: blob.contentHash,
+    });
+
+    const items = database.listPlugins(userId);
+    assert.equal(items.length, 2);
+
+    const removed = database.applyPluginOperation(userId, {
+      operationId: 'plugin-remove-a',
+      deviceId: 'phone',
+      sequence: 2,
+      occurredAtMs: 3_000,
+      kind: 'music-source',
+      action: 'remove',
+      identityKey: items[0].identityKey,
+    });
+
+    assert.equal(removed?.changed, true);
+    assert.equal(database.listPlugins(userId).length, 0);
+    assert.equal(database.listPlugins(userId, {includeDeleted: true}).length, 2);
+  });
+});

@@ -1573,9 +1573,21 @@ export class SyncDatabase {
           persistResult(result, revision, false, false, false);
           return result;
         }
-        this.db
-          .prepare(`UPDATE user_plugins SET revision = ?, deleted_at = ?, updated_at = ? WHERE user_id = ? AND id = ?`)
-          .run(revision, at, at, userId, existing.id);
+        const duplicates = kind === 'music-source' && existing.content_hash
+          ? this.db
+              .prepare(
+                `SELECT * FROM user_plugins
+                 WHERE user_id = ? AND kind = 'music-source' AND content_hash = ? AND deleted_at IS NULL
+                 ORDER BY created_at ASC, id ASC`,
+              )
+              .all(userId, existing.content_hash) as UserPluginRow[]
+          : [existing];
+        const removedRows = duplicates.length > 0 ? duplicates : [existing];
+        for (const row of removedRows) {
+          this.db
+            .prepare(`UPDATE user_plugins SET revision = ?, deleted_at = ?, updated_at = ? WHERE user_id = ? AND id = ?`)
+            .run(revision, at, at, userId, row.id);
+        }
         const payload = this.toSyncedPlugin({...existing, revision, deleted_at: at, updated_at: at});
         this.recordEvent(userId, revision, 'plugin', identityKey, 'delete', payload, at, at);
         const result = {
