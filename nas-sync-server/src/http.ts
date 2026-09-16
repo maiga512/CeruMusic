@@ -13,6 +13,7 @@ const ADMIN_PASSWORD_SETTING_KEY = 'admin.passwordHash';
 const ADMIN_USERNAME_SETTING_KEY = 'admin.username';
 const DEFAULT_ADMIN_USERNAME = 'admin';
 const DEFAULT_ADMIN_PASSWORD = 'password';
+const MAX_REQUEST_BODY_BYTES = MAX_PLUGIN_SCRIPT_BYTES + 64 * 1024;
 
 export type ServerConfig = {
   port: number;
@@ -29,18 +30,28 @@ type RouteHandler = (ctx: {
 }) => Promise<unknown> | unknown;
 
 const readBody = async (request: IncomingMessage): Promise<UnknownRecord> => {
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  if (!chunks.length) return {};
-  const buffer = Buffer.concat(chunks);
-  if (buffer.byteLength > MAX_PLUGIN_SCRIPT_BYTES + 64 * 1024) {
+  const declaredLength = Number(request.headers['content-length'] || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_BYTES) {
     const error = new Error('请求体过大');
     Object.assign(error, {statusCode: 413});
     throw error;
   }
+
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+    if (totalBytes > MAX_REQUEST_BODY_BYTES) {
+      const error = new Error('请求体过大');
+      Object.assign(error, {statusCode: 413});
+      throw error;
+    }
+    chunks.push(buffer);
+  }
+
+  if (!chunks.length) return {};
+  const buffer = Buffer.concat(chunks);
   const contentType = String(request.headers['content-type'] || '').toLowerCase();
 
   if (contentType.includes('application/json')) {
@@ -441,18 +452,28 @@ const createRouter = (database: SyncDatabase): Record<string, Partial<Record<str
     },
   },
   '/sync/wait': {
-    GET: ({auth, url}) => {
+    GET: async ({auth, url, response}) => {
       const session = requireAuth(auth);
       const sinceRevision = Number(url.searchParams.get('sinceRevision') || 0);
       const timeoutMs = Math.min(
         25_000,
         Math.max(0, Number(url.searchParams.get('timeout') || 20_000)),
       );
-      return database.waitForSyncEvents(
-        session.user.id,
-        Number.isFinite(sinceRevision) ? sinceRevision : 0,
-        Number.isFinite(timeoutMs) ? timeoutMs : 20_000,
-      );
+      const abortController = new AbortController();
+      const abortIfDisconnected = () => {
+        if (!response.writableEnded) abortController.abort();
+      };
+      response.once('close', abortIfDisconnected);
+      try {
+        return await database.waitForSyncEvents(
+          session.user.id,
+          Number.isFinite(sinceRevision) ? sinceRevision : 0,
+          Number.isFinite(timeoutMs) ? timeoutMs : 20_000,
+          abortController.signal,
+        );
+      } finally {
+        response.off('close', abortIfDisconnected);
+      }
     },
   },
   '/user-songlist': {

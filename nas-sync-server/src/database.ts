@@ -599,7 +599,8 @@ export class SyncDatabase {
       .prepare(`SELECT COUNT(*) AS total FROM playlist_songs WHERE user_id = ? AND playlist_id = ? AND deleted_at IS NULL`)
       .get(userId, playlistId) as {total: number};
 
-    return {playlist: toPlaylist(playlist, total.total), list: rows.map(toPlaylistSong), songs: rows.map(toPlaylistSong), total: total.total};
+    const songs = rows.map(toPlaylistSong);
+    return {playlist: toPlaylist(playlist, total.total), list: songs, songs, total: total.total};
   }
 
   createPlaylist(userId: string, input: PlaylistInput) {
@@ -1795,24 +1796,32 @@ export class SyncDatabase {
     return {revision: this.getCurrentRevision(userId), events: rows.map(toSyncEvent)};
   }
 
-  async waitForSyncEvents(userId: string, sinceRevision: number, timeoutMs: number) {
+  async waitForSyncEvents(
+    userId: string,
+    sinceRevision: number,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ) {
     const immediate = this.getSyncEvents(userId, sinceRevision);
-    if (immediate.events.length > 0 || timeoutMs <= 0) return immediate;
+    if (immediate.events.length > 0 || timeoutMs <= 0 || signal?.aborted) return immediate;
 
     await new Promise<void>((resolve) => {
       let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const waiters = this.syncWaiters.get(userId) || new Set<() => void>();
       const finish = () => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', finish);
         waiters.delete(finish);
         if (waiters.size === 0) this.syncWaiters.delete(userId);
         resolve();
       };
-      const timer = setTimeout(finish, timeoutMs);
+      signal?.addEventListener('abort', finish, {once: true});
       waiters.add(finish);
       this.syncWaiters.set(userId, waiters);
+      timer = setTimeout(finish, timeoutMs);
     });
 
     return this.getSyncEvents(userId, sinceRevision);

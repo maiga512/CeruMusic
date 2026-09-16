@@ -77,6 +77,34 @@ test('cross-device stale add cannot resurrect a later remove', () => {
   });
 });
 
+test('playlist detail reuses one converted song array for list and songs', () => {
+  withDatabase((database, userId, playlistId) => {
+    const detail = database.getPlaylistSongs(userId, playlistId);
+    assert.ok(detail);
+    assert.strictEqual(detail.list, detail.songs);
+    assert.equal(detail.list[0]?.songmid, 'seed');
+  });
+});
+
+test('waiting for sync events releases immediately when aborted', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ceru-sync-abort-test-'));
+  const database = new SyncDatabase(join(directory, 'sync.sqlite'));
+  const user = database.createUser({username: `abort-${Date.now()}`, passwordHash: 'hash'});
+  const controller = new AbortController();
+
+  try {
+    const startedAt = Date.now();
+    const waiting = database.waitForSyncEvents(user.id, 0, 20_000, controller.signal);
+    controller.abort();
+    const result = await waiting;
+    assert.equal(result.events.length, 0);
+    assert.ok(Date.now() - startedAt < 1_000);
+  } finally {
+    database.close();
+    rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 test('a genuinely later add still wins after a remove', () => {
   withDatabase((database, userId, playlistId) => {
     database.applySongOperation(userId, {
